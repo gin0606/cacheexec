@@ -1,0 +1,14 @@
+[package]
+name = "cacheexec"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Cache non-interactive command output and exit status"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+humantime = "2"
+sha2 = "0.10"
+tempfile = "3"
