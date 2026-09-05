@@ -14,6 +14,7 @@ pub struct Execution {
     pub code: i32,
     pub record: Record,
     pub reusable: bool,
+    pub delivery: Delivery,
 }
 
 fn capture(mut input: impl Read, output: mpsc::Sender<Vec<u8>>) -> Result<Vec<u8>> {
@@ -82,21 +83,7 @@ pub fn execute(argv: &[OsString]) -> Result<Execution> {
         (status, completed, out.join(), err.join())
     });
     let status = status.context("wait for child")?;
-    while crate::signals::received() == 0 && !(out_writer.is_finished() && err_writer.is_finished())
-    {
-        thread::sleep(Duration::from_millis(10));
-    }
     let interrupted = crate::signals::received();
-    if interrupted == 0 {
-        for writer in [out_writer, err_writer] {
-            writer
-                .join()
-                .map_err(|_| anyhow!("output writer panicked"))?
-                .with_context(|| {
-                    format!("child already completed with {status}; output transfer failed")
-                })?;
-        }
-    }
     let code = if interrupted != 0 {
         128 + interrupted
     } else {
@@ -129,7 +116,31 @@ pub fn execute(argv: &[OsString]) -> Result<Execution> {
         code,
         record,
         reusable,
+        delivery: Delivery([out_writer, err_writer]),
     })
+}
+
+pub struct Delivery([thread::JoinHandle<Result<()>>; 2]);
+
+impl Delivery {
+    pub fn finish(self, code: i32) -> Result<i32> {
+        while crate::signals::received() == 0 && !self.0.iter().all(|writer| writer.is_finished()) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let signal = crate::signals::received();
+        if signal != 0 {
+            return Ok(128 + signal);
+        }
+        for writer in self.0 {
+            writer
+                .join()
+                .map_err(|_| anyhow!("output writer panicked"))?
+                .with_context(|| {
+                    format!("child already completed with exit code {code}; output transfer failed")
+                })?;
+        }
+        Ok(code)
+    }
 }
 
 fn exited_without_reaping(pid: u32) -> std::io::Result<bool> {

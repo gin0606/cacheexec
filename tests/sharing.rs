@@ -473,16 +473,19 @@ fn replay_cancellation_exits_with_unread_stdout_or_stderr() {
 }
 
 #[test]
-fn owner_cancellation_publishes_even_with_blocked_output_consumer() {
+fn owner_delivery_cancellation_preserves_published_result() {
     use std::io::Read;
-    for stderr in [false, true] {
+    for (stderr, sig) in [false, true]
+        .into_iter()
+        .flat_map(|stderr| [0, libc::SIGINT, libc::SIGTERM].map(|sig| (stderr, sig)))
+    {
         let f = Fixture::new();
         let script = if stderr {
             "printf x >> count; while ! test -f go; do sleep 0.01; done; (dd if=/dev/zero bs=131072 count=1 2>/dev/null) >&2; printf done > finished"
         } else {
             "printf x >> count; while ! test -f go; do sleep 0.01; done; dd if=/dev/zero bs=131072 count=1 2>/dev/null; printf done > finished"
         };
-        let owner = f.spawn(&["--include-codes", "0"], script);
+        let mut owner = f.spawn(&["--include-codes", "0"], script);
         f.started();
         let mut waiter = f.spawn(&["--include-codes", "1"], script);
         f.joined(1);
@@ -500,9 +503,33 @@ fn owner_cancellation_publishes_even_with_blocked_output_consumer() {
         });
         f.release();
         wait_until(|| f.root.path().join("finished").exists());
-        signal(&owner, libc::SIGTERM);
-        assert_eq!(finish(owner).status.code(), Some(143));
-        assert_eq!(finish(waiter).status.code(), Some(143));
+        assert_eq!(finish(waiter).status.code(), Some(0));
+        assert!(owner.try_wait().unwrap().is_none());
+        if sig != 0 {
+            signal(&owner, sig);
+            assert_eq!(finish(owner).status.code(), Some(128 + sig));
+        } else {
+            let delivered = owner.wait_with_output().unwrap();
+            assert_eq!(delivered.status.code(), Some(0));
+            assert_eq!(
+                if stderr {
+                    delivered.stderr.len()
+                } else {
+                    delivered.stdout.len()
+                },
+                131072
+            );
+        }
+        let hit = f.spawn(&[], script).wait_with_output().unwrap();
+        assert_eq!(hit.status.code(), Some(0));
+        assert_eq!(
+            if stderr {
+                hit.stderr.len()
+            } else {
+                hit.stdout.len()
+            },
+            131072
+        );
         let out = drain_out.join().unwrap();
         let err = drain_err.join().unwrap();
         assert_eq!(if stderr { err.len() } else { out.len() }, 131072);
@@ -1078,4 +1105,29 @@ fn verbose_background_terminal_does_not_suspend_execution() {
         assert_eq!(libc::WEXITSTATUS(status), 7);
     }
     assert_eq!(f.count(), "xx");
+}
+
+#[test]
+fn owner_delivery_failure_does_not_fail_waiters_or_discard_cache() {
+    for stderr in [false, true] {
+        let f = Fixture::new();
+        let script = "printf x >> count; while ! test -f go; do sleep 0.01; done; printf out; printf err >&2";
+        let mut owner = f.spawn(&["--include-codes", "0"], script);
+        f.started();
+        let waiter = f.spawn(&["--include-codes", "1"], script);
+        f.joined(1);
+        if stderr {
+            drop(owner.stderr.take());
+        } else {
+            drop(owner.stdout.take());
+        }
+        f.release();
+        assert_eq!(finish(owner).status.code(), Some(125));
+        for result in [finish(waiter), finish(f.spawn(&[], script))] {
+            assert_eq!(result.status.code(), Some(0));
+            assert_eq!(result.stdout, b"out");
+            assert_eq!(result.stderr, b"err");
+        }
+        assert_eq!(f.count(), "x");
+    }
 }

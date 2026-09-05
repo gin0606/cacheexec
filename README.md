@@ -123,17 +123,30 @@ it is held only for existing waiters. Each waiter keeps its own execution genera
 so later executions cannot overwrite its result. Different keys run independently.
 A refresh already in progress takes precedence over the previous saved result.
 
-SIGINT/SIGTERM sent to the execution owner are forwarded to the child process group;
-all participants receive 128 + signal, and the result is not saved, even if the child
-handles the signal and exits normally. A signal sent only to a waiter ends that
-wait with 128 + signal and leaves the shared execution running. This also applies
-while replaying a completed result, even if the output consumer stops reading.
-Interrupting output delivery can truncate that invocation’s output or diagnostics. There is no child
-timeout: children that ignore these signals can continue to run. Descendants that
-leave the child process group are outside signal propagation guarantees.
+After the child exits and both output streams are collected, the owner commits to
+publishing the shared result. Saving and publication do not wait for delivery to
+the owner's output consumer, so a stalled consumer cannot hold up waiters.
+Delivery errors, such as a closed pipe, fail only that invocation with code 125;
+they do not invalidate shared or saved results.
 
-If the owner dies suddenly (including SIGKILL), waiters fail with a tool error
-without retrying. Kernel locks identify execution ownership, avoiding PID reuse
+SIGINT/SIGTERM received by the owner before the publication decision cancel the
+shared execution. While executing or collecting output, signals are forwarded to
+the child process group. All participants receive 128 + signal and the result is
+not saved, even if the child handles the signal and exits normally.
+After the publication decision, signals cancel only the owner's delivery with
+128 + signal; waiters and saved results are unaffected. Racing signals are ordered
+at a single decision point. Subsequent storage errors during publication still
+fail the shared execution.
+A signal sent only to a waiter ends that wait with 128 + signal and leaves the
+shared execution running. This also applies while replaying a completed result,
+even if the output consumer stops reading. Interrupting output delivery can
+truncate that invocation's output or diagnostics. There is no child timeout:
+children that ignore these signals can continue to run. Descendants that leave
+the child process group are outside signal propagation guarantees.
+
+If the owner dies suddenly (including SIGKILL) before publishing the shared result,
+waiters fail with a tool error without retrying. Death after publication leaves
+shared and saved results intact. Kernel locks identify execution ownership, avoiding PID reuse
 checks. A subsequent invocation can start a new execution; any child orphaned by
 SIGKILL may still be running and is not automatically killed. Shared temporary
 results are unlinked on completion and stay accessible through existing waiters'

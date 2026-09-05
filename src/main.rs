@@ -29,8 +29,9 @@ Execution:
   Same-key calls share execution, including --refresh and different policies.
   --verbose adds human diagnostics to stderr (best effort; not a stable format).
   Output is binary-safe; replay does not preserve timing between streams.
-  SIGINT/SIGTERM cancel waiters or reach the owner's child process group.
-  Owner death fails waiters without retry. No execution timeout.
+  Before publication, owner SIGINT/SIGTERM cancel the shared execution.
+  After publication, signals and delivery errors affect only that caller.
+  Owner death before publication fails waiters without retry. No execution timeout.
 
 Exit codes:
   0..255       Child's normal exit code

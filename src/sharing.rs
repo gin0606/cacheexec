@@ -196,14 +196,16 @@ pub fn run(
             stage(&mut active, &execution, &votes)?;
         }
         fs::remove_file(&active_path).context("remove completed execution marker")?;
-        if apply_interrupt(&mut execution, result_path)? {
+        let signal = signals::seal_execution();
+        if apply_signal(&mut execution, result_path, signal)? {
             stage(&mut active, &execution, &votes)?;
         }
         // Only this final byte publishes success. Shared data is temporary, so the
         // commit byte needs process visibility, not crash durability.
         active.seek(SeekFrom::Start(256))?;
         active.write_all(&[3]).context("commit shared result")?;
-        Ok((execution.code, saving_status(&execution, &votes)))
+        let saved = saving_status(&execution, &votes);
+        Ok((execution.code, saved, execution.delivery))
     });
     let outcome = match child_context {
         Some(context) => outcome.context(context),
@@ -231,14 +233,27 @@ pub fn run(
     }
     unlock(&active)?;
     unlock(&gate)?;
-    outcome.map(|(code, saved)| {
+    outcome.and_then(|(code, saved, delivery)| {
         let (kind, saving) = match saved {
             1 => ("completed", "yes"),
             2 => ("completed", "no reason=participant-policy"),
             _ => ("interrupted", "no reason=interrupted"),
         };
-        diagnostic.finish(format!("{kind} exit={code} saved={saving}"));
-        code
+        match delivery.finish(code) {
+            Ok(code) => {
+                let kind = if signals::received() != 0 {
+                    "interrupted"
+                } else {
+                    kind
+                };
+                diagnostic.finish(format!("{kind} exit={code} saved={saving}"));
+                Ok(code)
+            }
+            Err(error) => {
+                diagnostic.finish(format!("failed saved={saving} reason=delivery-failure"));
+                Err(error)
+            }
+        }
     })
 }
 
@@ -284,7 +299,10 @@ fn stage(active: &mut File, execution: &runner::Execution, votes: &[u8; 256]) ->
 }
 
 fn apply_interrupt(execution: &mut runner::Execution, path: &Path) -> Result<bool> {
-    let signal = signals::received();
+    apply_signal(execution, path, signals::received())
+}
+
+fn apply_signal(execution: &mut runner::Execution, path: &Path, signal: i32) -> Result<bool> {
     if signal == 0 {
         return Ok(false);
     }
