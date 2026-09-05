@@ -4,6 +4,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     os::fd::AsRawFd,
+    os::unix::fs::OpenOptionsExt,
     path::Path,
     thread,
     time::{Duration, SystemTime},
@@ -113,6 +114,7 @@ pub fn run(cli: &Cli, directory: &Path, key: &str, result_path: &Path) -> Result
         .read(true)
         .write(true)
         .create_new(true)
+        .mode(0o600)
         .open(&active_path)?;
     if !try_lock(&active, true)? {
         bail!("new execution unexpectedly locked");

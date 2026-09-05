@@ -75,6 +75,39 @@ fn signal(child: &Child, sig: i32) {
 }
 const SCRIPT: &str = "printf x >> count; while ! test -f go; do sleep 0.01; done; printf '\\377\\000out'; printf '\\376err' >&2; exit 7";
 #[test]
+fn shared_output_is_private_even_with_permissive_umask() {
+    use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+    let f = Fixture::new();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cacheexec"));
+    command
+        .current_dir(f.root.path())
+        .arg("--cache-dir")
+        .arg(f.root.path().join("cache"))
+        .args(["--ttl", "1h", "--", "sh", "-c", SCRIPT])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    unsafe {
+        command.pre_exec(|| {
+            libc::umask(0);
+            Ok(())
+        });
+    }
+    let owner = command.spawn().unwrap();
+    f.started();
+    let active = fs::read_dir(f.root.path().join("cache"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "active"))
+        .unwrap();
+    let mode = fs::metadata(active).unwrap().permissions().mode() & 0o777;
+    f.release();
+    assert_eq!(finish(owner).status.code(), Some(7));
+    assert_eq!(mode, 0o600);
+    assert_eq!(finish(f.spawn(&[], SCRIPT)).status.code(), Some(7));
+    assert_eq!(f.count(), "x");
+}
+
+#[test]
 fn mixed_policies_refresh_and_ttl_share_and_any_participant_can_save() {
     let f = Fixture::new();
     let leader = f.spawn(&["--include-codes", "0"], SCRIPT);
