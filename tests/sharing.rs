@@ -606,3 +606,476 @@ fn cleanup_reclaims_abandoned_marker_without_retrying_waiter() {
     assert_eq!(finish(f.spawn(&[], SCRIPT)).status.code(), Some(7));
     assert_eq!(f.count(), "xx");
 }
+
+const QUIET: &str = "printf x >> count; while ! test -f go; do sleep 0.01; done; exit 7";
+
+fn verbose_text(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+fn decision_before_completion(child: &mut Child, action: &str) {
+    use std::io::{BufRead, BufReader};
+    let stderr = child.stderr.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let mut stderr = BufReader::new(stderr);
+        let mut line = String::new();
+        while line.trim().is_empty() {
+            line.clear();
+            if stderr.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+        }
+        sender.send((line, stderr.into_inner())).unwrap();
+    });
+    let (line, stderr) = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("decision was delayed until completion");
+    assert!(
+        line.starts_with(&format!("cacheexec: verbose: {action}")),
+        "{line}"
+    );
+    assert!(!line.contains(" age="));
+    child.stderr = Some(stderr);
+}
+
+#[test]
+fn verbose_mixed_participants_report_decisions_early_and_actual_saving() {
+    for (owner_verbose, waiter_verbose) in [(true, false), (false, true), (true, true)] {
+        for save in [false, true] {
+            let f = Fixture::new();
+            let mut owner_options = vec!["--include-codes", "0"];
+            if owner_verbose {
+                owner_options.push("--verbose");
+            }
+            let mut owner = f.spawn(&owner_options, QUIET);
+            f.started();
+            if owner_verbose {
+                decision_before_completion(&mut owner, "run reason=missing");
+            }
+            let mut waiter_options = vec![
+                "--refresh",
+                "--ttl",
+                "0s",
+                "--include-codes",
+                if save { "1,7" } else { "1" },
+            ];
+            if waiter_verbose {
+                waiter_options.push("--verbose");
+            }
+            let mut waiter = f.spawn(&waiter_options, QUIET);
+            f.joined(1);
+            if waiter_verbose {
+                decision_before_completion(&mut waiter, "join");
+            }
+            let mut excluded = f.spawn(&["--verbose", "--exclude-codes", "0,1,7"], QUIET);
+            f.joined(2);
+            decision_before_completion(&mut excluded, "join");
+            let active = fs::read_dir(f.root.path().join("cache"))
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .find(|p| p.extension().is_some_and(|e| e == "active"))
+                .unwrap();
+            let generation = fs::File::open(active).unwrap();
+            f.release();
+            let expected = if save {
+                "completed exit=7 saved=yes"
+            } else {
+                "completed exit=7 saved=no reason=participant-policy"
+            };
+            for (output, verbose) in [
+                (finish(owner), owner_verbose),
+                (finish(waiter), waiter_verbose),
+                (finish(excluded), true),
+            ] {
+                assert_eq!(output.status.code(), Some(7));
+                if verbose {
+                    assert!(
+                        verbose_text(&output).contains(expected),
+                        "{}",
+                        verbose_text(&output)
+                    );
+                } else {
+                    assert!(output.stderr.is_empty());
+                }
+            }
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            (&generation).read_to_end(&mut bytes).unwrap();
+            assert!(!bytes.windows(18).any(|w| w == b"cacheexec: verbose:"));
+            assert_eq!(f.count(), "x");
+            let next = finish(f.spawn(&["--verbose"], QUIET));
+            assert!(verbose_text(&next).contains(if save {
+                "hit age="
+            } else {
+                "run reason=missing"
+            }));
+            assert_eq!(f.count(), if save { "x" } else { "xx" });
+        }
+    }
+}
+
+#[test]
+fn verbose_late_waiter_keeps_its_generation_saving_status() {
+    use std::os::fd::AsRawFd;
+    for first_saved in [false, true] {
+        let f = Fixture::new();
+        let owner = f.spawn(
+            &[
+                "--verbose",
+                "--include-codes",
+                if first_saved { "7" } else { "0" },
+            ],
+            QUIET,
+        );
+        f.started();
+        let mut waiter = f.spawn(&["--verbose", "--include-codes", "1"], QUIET);
+        f.joined(1);
+        decision_before_completion(&mut waiter, "join");
+        let path = fs::read_dir(f.root.path().join("cache"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|e| e == "lock"))
+            .unwrap();
+        let gate = fs::OpenOptions::new().write(true).open(path).unwrap();
+        assert_eq!(unsafe { libc::flock(gate.as_raw_fd(), libc::LOCK_EX) }, 0);
+        signal(&waiter, libc::SIGSTOP);
+        assert_eq!(unsafe { libc::flock(gate.as_raw_fd(), libc::LOCK_UN) }, 0);
+        f.release();
+        let first = finish(owner);
+        let next = finish(f.spawn(
+            &[
+                "--verbose",
+                "--refresh",
+                "--include-codes",
+                if first_saved { "0" } else { "7" },
+            ],
+            QUIET,
+        ));
+        signal(&waiter, libc::SIGCONT);
+        let late = finish(waiter);
+        let saved = if first_saved {
+            "saved=yes"
+        } else {
+            "saved=no reason=participant-policy"
+        };
+        assert!(verbose_text(&first).contains(saved));
+        assert!(
+            verbose_text(&late).contains(saved),
+            "{}",
+            verbose_text(&late)
+        );
+        assert!(verbose_text(&next).contains(if first_saved {
+            "saved=no reason=participant-policy"
+        } else {
+            "saved=yes"
+        }));
+        assert_eq!(late.status.code(), Some(7));
+        assert_eq!(f.count(), "xx");
+    }
+}
+
+#[test]
+fn verbose_owner_and_waiter_interruptions_preserve_uncertainty() {
+    for sig in [libc::SIGINT, libc::SIGTERM] {
+        for interrupt_owner in [false, true] {
+            let f = Fixture::new();
+            let owner = f.spawn(&["--verbose", "--include-codes", "7"], QUIET);
+            f.started();
+            let mut waiter = f.spawn(&["--verbose", "--include-codes", "1"], QUIET);
+            f.joined(1);
+            decision_before_completion(&mut waiter, "join");
+            signal(if interrupt_owner { &owner } else { &waiter }, sig);
+            let waited = finish(waiter);
+            assert_eq!(waited.status.code(), Some(128 + sig));
+            let text = verbose_text(&waited);
+            assert!(text.contains(&format!("interrupted exit={}", 128 + sig)));
+            assert!(
+                text.contains(if interrupt_owner {
+                    "saved=no reason=interrupted"
+                } else {
+                    "saved=unknown reason=waiter-interrupted"
+                }),
+                "{text}"
+            );
+            f.release();
+            let owned = finish(owner);
+            assert_eq!(
+                owned.status.code(),
+                Some(if interrupt_owner { 128 + sig } else { 7 })
+            );
+            assert!(verbose_text(&owned).contains(if interrupt_owner {
+                "saved=no reason=interrupted"
+            } else {
+                "saved=yes"
+            }));
+            assert_eq!(f.count(), "x");
+        }
+    }
+}
+
+#[test]
+fn verbose_owner_death_and_save_failure_never_report_success() {
+    for death in [false, true] {
+        let f = Fixture::new();
+        let owner = f.spawn(&["--verbose", "--include-codes", "7"], QUIET);
+        f.started();
+        let mut waiter = f.spawn(&["--verbose", "--include-codes", "1"], QUIET);
+        f.joined(1);
+        decision_before_completion(&mut waiter, "join");
+        if death {
+            signal(&owner, libc::SIGKILL);
+        } else {
+            let active = fs::read_dir(f.root.path().join("cache"))
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .find(|p| p.extension().is_some_and(|e| e == "active"))
+                .unwrap();
+            fs::create_dir(active.with_extension("result")).unwrap();
+        }
+        f.release();
+        let owned = finish(owner);
+        let waited = finish(waiter);
+        assert_eq!(waited.status.code(), Some(125));
+        for output in if death {
+            vec![waited]
+        } else {
+            vec![owned, waited]
+        } {
+            let text = verbose_text(&output);
+            assert!(
+                text.contains("failed saved=unknown reason=failure"),
+                "{text}"
+            );
+            assert!(!text.contains("saved=yes") && !text.contains("completed exit="));
+        }
+        assert_eq!(f.count(), "x");
+    }
+}
+
+#[test]
+fn verbose_closed_or_stalled_stderr_cannot_block_execution_saving_or_waiters() {
+    use std::{
+        io::Write,
+        os::fd::{AsRawFd, FromRawFd},
+    };
+    for closed in [false, true] {
+        for blocked_owner in [false, true] {
+            let f = Fixture::new();
+            let mut fds = [0; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            let reader = unsafe { fs::File::from_raw_fd(fds[0]) };
+            let mut writer = unsafe { fs::File::from_raw_fd(fds[1]) };
+            // Fill the pipe before spawning; the child's descriptor remains blocking.
+            assert_eq!(
+                unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
+                0
+            );
+            if !closed {
+                while writer.write(&[b'x'; 4096]).is_ok() {}
+            }
+            assert_eq!(
+                unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, 0) },
+                0
+            );
+            let reader = if closed {
+                drop(reader);
+                None
+            } else {
+                Some(reader)
+            };
+            let spawn_blocked = |policy| {
+                Command::new(env!("CARGO_BIN_EXE_cacheexec"))
+                    .current_dir(f.root.path())
+                    .arg("--cache-dir")
+                    .arg(f.root.path().join("cache"))
+                    .args([
+                        "--ttl",
+                        "1h",
+                        "--verbose",
+                        "--include-codes",
+                        policy,
+                        "--",
+                        "sh",
+                        "-c",
+                        QUIET,
+                    ])
+                    .stderr(Stdio::from(writer.try_clone().unwrap()))
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            };
+            let owner = if blocked_owner {
+                spawn_blocked("7")
+            } else {
+                f.spawn(&["--verbose", "--include-codes", "7"], QUIET)
+            };
+            f.started();
+            let waiter = if blocked_owner {
+                f.spawn(&["--verbose", "--include-codes", "1"], QUIET)
+            } else {
+                spawn_blocked("1")
+            };
+            f.joined(1);
+            f.release();
+            assert_eq!(finish(owner).status.code(), Some(7));
+            assert_eq!(finish(waiter).status.code(), Some(7));
+            assert_eq!(finish(spawn_blocked("7")).status.code(), Some(7));
+            assert_eq!(
+                unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
+                0
+            );
+            let hit = finish(f.spawn(&[], QUIET));
+            assert_eq!(hit.status.code(), Some(7));
+            assert!(hit.stderr.is_empty());
+            assert_eq!(f.count(), "x");
+            drop(reader);
+        }
+    }
+}
+
+#[test]
+fn verbose_file_size_write_failure_does_not_deliver_sigxfsz() {
+    use std::os::unix::process::CommandExt;
+    let f = Fixture::new();
+    f.release();
+    let log = fs::File::create(f.root.path().join("diagnostic")).unwrap();
+    log.set_len(4096).unwrap();
+    let mut log = log;
+    use std::io::{Seek, SeekFrom};
+    log.seek(SeekFrom::End(0)).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cacheexec"));
+    command
+        .current_dir(f.root.path())
+        .arg("--cache-dir")
+        .arg(f.root.path().join("cache"))
+        .args(["--ttl", "1h", "--verbose", "--", "sh", "-c", QUIET])
+        .stderr(Stdio::from(log));
+    unsafe {
+        command.pre_exec(|| {
+            let limit = libc::rlimit {
+                rlim_cur: 4096,
+                rlim_max: 4096,
+            };
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    assert_eq!(finish(command.spawn().unwrap()).status.code(), Some(7));
+    assert_eq!(finish(f.spawn(&[], QUIET)).status.code(), Some(7));
+    assert_eq!(f.count(), "x");
+}
+
+#[test]
+fn verbose_background_terminal_does_not_suspend_execution() {
+    use std::os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::process::CommandExt,
+    };
+    const HELPER: &str = "CACHEEXEC_TEST_BACKGROUND_TERMINAL";
+    if std::env::var_os(HELPER).is_none() {
+        let output = finish(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "verbose_background_terminal_does_not_suspend_execution",
+                    "--nocapture",
+                ])
+                .env(HELPER, "1")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    // A subprocess owns this controlling terminal so job control cannot affect
+    // the test harness. Keep its master open until the subprocess exits (SIGHUP).
+    assert!(unsafe { libc::setsid() } >= 0);
+    let mut master = -1;
+    let mut slave = -1;
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        },
+        0
+    );
+    let _master = std::mem::ManuallyDrop::new(unsafe { fs::File::from_raw_fd(master) });
+    let slave = unsafe { fs::File::from_raw_fd(slave) };
+    assert_eq!(
+        unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCSCTTY as _, 0) },
+        0
+    );
+    let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut attributes) },
+        0
+    );
+    attributes.c_lflag |= libc::TOSTOP;
+    assert_eq!(
+        unsafe { libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &attributes) },
+        0
+    );
+    assert_eq!(
+        unsafe { libc::tcsetpgrp(slave.as_raw_fd(), libc::getpgrp()) },
+        0
+    );
+    let f = Fixture::new();
+    for options in [&[][..], &["--verbose", "--refresh"][..], &["--verbose"][..]] {
+        // waitpid below reaps the child and also observes job-control stops.
+        #[allow(clippy::zombie_processes)]
+        let child = Command::new(env!("CARGO_BIN_EXE_cacheexec"))
+            .current_dir(f.root.path())
+            .process_group(0)
+            .arg("--cache-dir")
+            .arg(f.root.path().join("cache"))
+            .args(["--ttl", "1h"])
+            .args(options)
+            .args(["--", "sh", "-c", "printf x >> count; exit 7"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(slave.try_clone().unwrap()))
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut status = 0;
+        loop {
+            let found = unsafe {
+                libc::waitpid(
+                    child.id() as i32,
+                    &mut status,
+                    libc::WNOHANG | libc::WUNTRACED,
+                )
+            };
+            assert!(found >= 0);
+            if (found > 0 && libc::WIFSTOPPED(status)) || Instant::now() >= deadline {
+                unsafe {
+                    libc::killpg(child.id() as i32, libc::SIGKILL);
+                    libc::waitpid(child.id() as i32, std::ptr::null_mut(), 0);
+                }
+                panic!("background execution stopped or timed out: status={status}");
+            }
+            if found > 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 7);
+    }
+    assert_eq!(f.count(), "xx");
+}

@@ -23,7 +23,7 @@ interpretation; explicitly use `sh -c` for pipelines, redirects or expansions.
 The child inherits the environment, receives closed stdin, and streams its stdout
 and stderr while running. A hit skips execution and replays each byte stream and
 the original exit code. Non-UTF-8 bytes are preserved. Stream timing and ordering
-between stdout and stderr are not preserved on replay. No hit/miss logs are added.
+between stdout and stderr are not preserved on replay. Diagnostics are added only when `--verbose` is specified.
 
 ## TTL, exit-code selection and refresh
 
@@ -38,6 +38,50 @@ mutually exclusive and each invocation applies its own policy to existing result
 Start failures and signal termination are never saved. `--refresh` invalidates
 the previous result before starting again. Ineligible, failed or interrupted
 updates never restore old results. Commands are never automatically retried.
+
+## Inspecting cache behavior
+
+```sh
+cacheexec --ttl 5m --verbose -- ./query
+```
+
+`--verbose` adds human-readable diagnostics to **stderr**, prefixed with
+`cacheexec: verbose:`. For example (wording and duration formatting may change):
+
+```text
+cacheexec: verbose: run reason=missing ttl=5m key=… cache-dir="/…/cacheexec"
+cacheexec: verbose: completed exit=0 saved=yes
+```
+
+A decision is reported when made, without waiting for execution or a join to
+finish: `hit` reuses a saved result, `run` starts a command, and `join` waits for
+an existing same-key execution. An active execution takes priority over TTL,
+code selection, and refresh. Run reasons have this priority: `refresh`, `missing`,
+`future-timestamp`, `expired`, then `policy`. Decisions include the applied TTL,
+key hash and absolute cache directory. When a saved result was evaluated, `age`
+shows seconds since completion (negative for future timestamps).
+
+Completion reports the exit result and whether that generation was saved.
+`reason=participant-policy` means no participant allowed the exit code;
+`reason=reused` means a hit made no new save. Interruptions and failures are
+identified separately from normal completion. A join reports the shared generation's
+saving outcome, including another participant's permission to save. `saved=unknown`
+means it could not be established, such as when only the waiter was interrupted
+before publication or the owner disappeared.
+
+Diagnostics are generated per invocation and never stored in cached stdout/stderr.
+Owners and waiters each honor their own `--verbose`; it does not change keys,
+reuse rules, saving policies or sharing. Diagnostic fields omit commands, arguments,
+environment values, extra-key values and child output. Paths and control characters
+are escaped. The prefix distinguishes diagnostics from child stderr and tool errors,
+but a child can print the same prefix.
+
+Delivery is **best effort**: diagnostic write failures, closed pipes and stalled
+readers cannot prevent execution, publication, saving or exit. Diagnostics may be
+dropped or truncated; prompt delivery is not guaranteed to a blocked reader.
+Existing child-output transfer behavior is unchanged. This is not a stable format
+for machine parsing; there is no JSON format or environment-variable switch.
+`--clear --verbose` is an argument error; cleanup retains its count summary.
 
 ## Keys and storage
 

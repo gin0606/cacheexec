@@ -472,3 +472,244 @@ fn clear_permission_failure_is_explicit() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("delete cached result"));
     assert!(f.result().exists());
 }
+
+fn diagnostics(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[test]
+fn verbose_decisions_reasons_metadata_and_uncached_output() {
+    use sha2::{Digest, Sha256};
+    let f = Fixture::new();
+    let script = "printf x >> count; printf out; printf 'child-error\n' >&2; exit 7";
+    let run = |options: &[&str]| {
+        let mut args = vec!["--verbose", "--ttl", "1h"];
+        args.extend(options);
+        f.run(&args, script)
+    };
+    let first = run(&[]);
+    let text = diagnostics(&first);
+    assert!(text.contains("run reason=missing ttl=1h key="), "{text}");
+    assert!(!text.contains(" age="));
+    assert!(text.contains("completed exit=7 saved=yes"));
+    assert!(text.contains(&format!("cache-dir={:?}", f.root.path().join("cache"))));
+    let key = f.result().file_stem().unwrap().to_str().unwrap().to_owned();
+    assert!(text.contains(&format!("key={key}")));
+    let hit = run(&[]);
+    let text = diagnostics(&hit);
+    assert!(text.contains("hit age="));
+    assert!(text.contains("saved=no reason=reused"));
+    assert_eq!(hit.stdout, b"out");
+    assert_eq!(f.count(), "x");
+    let quiet = f.run(&["--ttl", "1h"], script);
+    assert_eq!(quiet.stderr, b"child-error\n");
+    let bytes = fs::read(f.result()).unwrap();
+    assert!(
+        !bytes
+            .windows(b"cacheexec: verbose:".len())
+            .any(|w| w == b"cacheexec: verbose:")
+    );
+    assert_eq!(&bytes[..8], b"CEXEC001");
+    let completed = u128::from_le_bytes(bytes[8..24].try_into().unwrap());
+    let age = text
+        .split("age=")
+        .nth(1)
+        .unwrap()
+        .split('s')
+        .next()
+        .unwrap()
+        .parse::<f64>()
+        .unwrap();
+    let actual_age = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
+        - completed as f64 / 1e9;
+    assert!(age >= 0.0 && age <= actual_age && actual_age - age < 1.0);
+    let policy = run(&["--include-codes", "0"]);
+    assert!(diagnostics(&policy).contains("run reason=policy age="));
+    assert!(diagnostics(&policy).contains("completed exit=7 saved=no reason=participant-policy"));
+    assert_eq!(f.count(), "xx");
+    assert!(diagnostics(&run(&[])).contains("run reason=missing"));
+    assert!(
+        diagnostics(&run(&["--refresh", "--include-codes", "0"]))
+            .contains("run reason=refresh age=")
+    );
+    run(&[]);
+    let expired = f.run(
+        &["--verbose", "--ttl", "0s", "--include-codes", "0"],
+        script,
+    );
+    assert!(diagnostics(&expired).contains("run reason=expired age="));
+    run(&[]);
+    let mut future = fs::read(f.result()).unwrap();
+    let nanos = (std::time::SystemTime::now() + Duration::from_secs(3600))
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    future[8..24].copy_from_slice(&nanos.to_le_bytes());
+    let end = future.len() - 32;
+    let checksum = Sha256::digest(&future[..end]);
+    future[end..].copy_from_slice(&checksum);
+    fs::write(f.result(), &future).unwrap();
+    let future_output = run(&["--include-codes", "0"]);
+    assert!(diagnostics(&future_output).contains("run reason=future-timestamp age=-"));
+    assert_eq!(f.count(), "xxxxxxxx");
+    for output in [first, hit, policy, expired, future_output] {
+        assert_eq!(output.status.code(), Some(7));
+        assert!(diagnostics(&output).contains(&format!("key={key}")));
+    }
+}
+
+#[test]
+fn verbose_keys_and_escaped_paths_do_not_disclose_inputs() {
+    let f = Fixture::new();
+    let directory = f.root.path().join("cache\nforged\r\x1b");
+    let run = |key, cwd: &std::path::Path, options: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_cacheexec"))
+            .current_dir(cwd)
+            .env("PRIVATE_VALUE", "environment-secret")
+            .arg("--cache-dir")
+            .arg(&directory)
+            .args(["--ttl", "1h", "--verbose", "--key", key])
+            .args(options)
+            .args(["--", "sh", "-c", "true", "argument-secret"])
+            .output()
+            .unwrap()
+    };
+    let a = run("key-secret", f.root.path(), &[]);
+    let b = run("another-key", f.root.path(), &[]);
+    let sub = f.root.path().join("sub");
+    fs::create_dir(&sub).unwrap();
+    let c = run("key-secret", &sub, &[]);
+    let d = run(
+        "key-secret",
+        f.root.path(),
+        &["--refresh", "--exclude-codes", "1"],
+    );
+    let key = |output: &Output| {
+        diagnostics(output)
+            .split("key=")
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_owned()
+    };
+    assert_ne!(key(&a), key(&b));
+    assert_ne!(key(&a), key(&c));
+    assert_eq!(key(&a), key(&d));
+    for output in [a, b, c, d] {
+        let text = diagnostics(&output);
+        assert_eq!(
+            text.lines().filter(|line| !line.is_empty()).count(),
+            2,
+            "{text}"
+        );
+        assert!(
+            text.lines()
+                .filter(|line| !line.is_empty())
+                .all(|line| line.starts_with("cacheexec: verbose: "))
+        );
+        assert!(text.contains("cache\\nforged\\r\\u{1b}"), "{text}");
+        for secret in [
+            "key-secret",
+            "another-key",
+            "environment-secret",
+            "argument-secret",
+        ] {
+            assert!(!text.contains(secret));
+        }
+    }
+}
+
+#[test]
+fn verbose_failure_interrupt_and_cli_contracts() {
+    let f = Fixture::new();
+    let missing = f
+        .command()
+        .args(["--ttl", "1h", "--verbose", "--", "./does-not-exist"])
+        .output()
+        .unwrap();
+    assert_eq!(missing.status.code(), Some(125));
+    assert!(diagnostics(&missing).contains("failed saved=no reason=failure"));
+    assert!(!diagnostics(&missing).contains("completed exit="));
+    let interrupted = f.run(&["--ttl", "1h", "--verbose"], "kill -TERM $$");
+    assert_eq!(interrupted.status.code(), Some(143));
+    assert!(diagnostics(&interrupted).contains("interrupted exit=143 saved=no reason=interrupted"));
+    assert_eq!(
+        f.command()
+            .args(["--clear", "--verbose"])
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(2)
+    );
+    let help = f.command().arg("--help").output().unwrap();
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(
+        help.contains("--verbose")
+            && help.contains("stderr")
+            && help.contains("best effort")
+            && help.contains("not a stable format")
+    );
+}
+
+#[test]
+fn verbose_completion_has_its_own_line_after_unterminated_child_stderr() {
+    let f = Fixture::new();
+    let script = "printf x >> count; printf child >&2";
+    for _ in 0..2 {
+        let output = f.run(&["--verbose", "--ttl", "1h"], script);
+        let text = diagnostics(&output);
+        assert!(
+            text.contains("child\n") && text.contains("\ncacheexec: verbose: completed exit=0"),
+            "{text}"
+        );
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("cacheexec: verbose:"))
+                .count(),
+            2
+        );
+    }
+    assert_eq!(f.run(&["--ttl", "1h"], script).stderr, b"child");
+    assert_eq!(f.count(), "x");
+}
+
+#[test]
+fn verbose_delayed_decisions_keep_line_boundaries_during_concurrent_replay() {
+    use std::process::Stdio;
+    let f = Fixture::new();
+    let script = "printf x >> count; printf child >&2";
+    f.run(&["--ttl", "1h"], script);
+    for _ in 0..4 {
+        let callers: Vec<_> = (0..32)
+            .map(|_| {
+                f.command()
+                    .args(["--verbose", "--ttl", "1h", "--", "sh", "-c", script])
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        for caller in callers {
+            let output = caller.wait_with_output().unwrap();
+            assert!(output.status.success());
+            let text = diagnostics(&output);
+            assert!(text.contains("hit age="), "{text}");
+            assert_eq!(text.matches("cacheexec: verbose:").count(), 2, "{text}");
+            assert_eq!(
+                text.lines()
+                    .filter(|line| line.starts_with("cacheexec: verbose:"))
+                    .count(),
+                2,
+                "{text}"
+            );
+        }
+    }
+    assert_eq!(f.count(), "x");
+}

@@ -3,6 +3,7 @@ mod cleanup;
 mod runner;
 mod sharing;
 mod signals;
+mod verbose;
 
 use anyhow::{Context, Result, bail};
 use clap::{
@@ -18,6 +19,7 @@ use std::{ffi::OsString, path::PathBuf, time::Duration};
     after_help = "Examples:
   cacheexec --ttl 5m --include-codes 0 -- curl -fsS https://example.com/status
   cacheexec --ttl 5m --include-codes 0,1 -- sh -c './condition-check.sh'
+  cacheexec --ttl 5m --verbose -- sh -c ./check.sh
   cacheexec --clear --older-than 24h
 
 Execution:
@@ -25,6 +27,7 @@ Execution:
   All normal exit codes, including nonzero codes, are cached by default.
   TTL starts at completion (500ms, 5m, 1h). Environment changes are not keyed.
   Same-key calls share execution, including --refresh and different policies.
+  --verbose adds human diagnostics to stderr (best effort; not a stable format).
   Output is binary-safe; replay does not preserve timing between streams.
   SIGINT/SIGTERM cancel waiters or reach the owner's child process group.
   Owner death fails waiters without retry. No execution timeout.
@@ -63,6 +66,9 @@ struct Cli {
     /// Invalidate the old result, or join an execution already in progress
     #[arg(long)]
     refresh: bool,
+    /// Explain cache decisions and saving on stderr (best effort, human-readable)
+    #[arg(long, conflicts_with = "clear")]
+    verbose: bool,
     /// Save/reuse only these exit codes (comma-separated, 0..255)
     #[arg(long, value_delimiter = ',', conflicts_with = "exclude_codes")]
     include_codes: Option<Vec<u8>>,
@@ -89,7 +95,7 @@ impl Cli {
     }
 }
 
-fn run(cli: Cli) -> Result<i32> {
+fn run(cli: Cli, diagnostic: &verbose::Verbose) -> Result<i32> {
     let directory = match cli.cache_dir.clone() {
         Some(path) => path,
         None => default_cache_dir()?,
@@ -101,7 +107,7 @@ fn run(cli: Cli) -> Result<i32> {
     let key = cache::key(&cli.command, &cwd, cli.key.as_deref());
     let path = directory.join(format!("{key}.result"));
     std::fs::create_dir_all(&directory).context("create cache directory")?;
-    sharing::run(&cli, &directory, &key, &path)
+    sharing::run(&cli, &directory, &key, &path, diagnostic)
 }
 
 fn default_cache_dir() -> Result<PathBuf> {
@@ -131,7 +137,15 @@ fn parse_cli() -> Cli {
 }
 
 fn main() {
-    let code = match signals::install().and_then(|()| run(parse_cli())) {
+    let code = match signals::install().and_then(|()| {
+        let cli = parse_cli();
+        let diagnostic = verbose::Verbose::new(cli.verbose);
+        let outcome = run(cli, &diagnostic);
+        if outcome.is_err() {
+            diagnostic.failed("unknown");
+        }
+        outcome
+    }) {
         Ok(code) => code,
         Err(error) => {
             let diagnostic = std::thread::spawn(move || eprintln!("cacheexec: {error:#}"));

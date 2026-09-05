@@ -1,4 +1,7 @@
-use crate::{Cli, cache, runner, signals};
+use crate::{
+    Cli, cache, runner, signals,
+    verbose::{self, Verbose},
+};
 use anyhow::{Context, Result, bail};
 use std::{
     fs::{self, File, OpenOptions},
@@ -54,7 +57,13 @@ fn vote(file: &mut File, cli: &Cli) -> Result<()> {
     file.write_all(&votes)?;
     Ok(())
 }
-pub fn run(cli: &Cli, directory: &Path, key: &str, result_path: &Path) -> Result<i32> {
+pub fn run(
+    cli: &Cli,
+    directory: &Path,
+    key: &str,
+    result_path: &Path,
+    diagnostic: &Verbose,
+) -> Result<i32> {
     let gate = OpenOptions::new()
         .read(true)
         .write(true)
@@ -63,6 +72,10 @@ pub fn run(cli: &Cli, directory: &Path, key: &str, result_path: &Path) -> Result
         .open(directory.join(format!("{key}.lock")))
         .context("open key lock")?;
     if !lock(&gate, true)? {
+        diagnostic.finish(format!(
+            "interrupted exit={} saved=unknown reason=interrupted",
+            128 + signals::received()
+        ));
         return Ok(128 + signals::received());
     }
     let active_path = directory.join(format!("{key}.active"));
@@ -71,7 +84,12 @@ pub fn run(cli: &Cli, directory: &Path, key: &str, result_path: &Path) -> Result
             if !try_lock(&active, true)? {
                 vote(&mut active, cli)?;
                 unlock(&gate)?;
+                diagnostic.decision("join", None, cli, directory, key);
                 if !lock(&active, true)? {
+                    diagnostic.finish(format!(
+                        "interrupted exit={} saved=unknown reason=waiter-interrupted",
+                        128 + signals::received()
+                    ));
                     return Ok(128 + signals::received());
                 }
                 active.seek(SeekFrom::Start(256))?;
@@ -81,7 +99,29 @@ pub fn run(cli: &Cli, directory: &Path, key: &str, result_path: &Path) -> Result
                 match bytes.split_first() {
                     Some((0, bytes)) => {
                         let record = cache::decode(bytes)?;
-                        return record.replay();
+                        return replay(record, "unknown", false, diagnostic);
+                    }
+                    Some((3, bytes)) => {
+                        let (saved, bytes) = bytes
+                            .split_first()
+                            .context("missing shared saving status")?;
+                        let (saving, interrupted) = match saved {
+                            1 => ("yes", false),
+                            2 => ("no reason=participant-policy", false),
+                            3 => ("no reason=interrupted", true),
+                            _ => bail!("invalid shared saving status"),
+                        };
+                        return replay(cache::decode(bytes)?, saving, interrupted, diagnostic);
+                    }
+                    Some((4, bytes)) => {
+                        let (invalidated, bytes) = bytes
+                            .split_first()
+                            .context("missing shared failure status")?;
+                        diagnostic.failed(if *invalidated == 1 { "no" } else { "unknown" });
+                        bail!(
+                            "shared execution failed: {}",
+                            String::from_utf8_lossy(bytes)
+                        );
                     }
                     Some((1, bytes)) => bail!(
                         "shared execution failed: {}",
@@ -99,15 +139,20 @@ pub fn run(cli: &Cli, directory: &Path, key: &str, result_path: &Path) -> Result
         Err(error) => return Err(error).context("open active execution"),
     }
     let previous = cache::load(result_path)?;
-    if !cli.refresh {
-        if let Some(record) = previous {
-            if record.fresh(cli.ttl.expect("execution requires TTL"), SystemTime::now())
-                && cli.allows(record.code)
-            {
-                unlock(&gate)?;
-                return record.replay();
-            }
-        }
+    let now = SystemTime::now();
+    let age = previous
+        .as_ref()
+        .map(|record| now.duration_since(record.completed));
+    let reason = verbose::reason(cli, previous.as_ref(), now);
+    if reason.is_none() {
+        unlock(&gate)?;
+        diagnostic.decision("hit", age, cli, directory, key);
+        return replay(
+            previous.expect("hit requires a result"),
+            "no reason=reused",
+            false,
+            diagnostic,
+        );
     }
     cache::invalidate(result_path)?;
     let mut active = OpenOptions::new()
@@ -123,6 +168,13 @@ pub fn run(cli: &Cli, directory: &Path, key: &str, result_path: &Path) -> Result
     active.write_all(&[2])?;
     vote(&mut active, cli)?;
     unlock(&gate)?;
+    diagnostic.decision(
+        &format!("run reason={}", reason.expect("run requires a reason")),
+        age,
+        cli,
+        directory,
+        key,
+    );
     let execution = runner::execute(&cli.command);
     lock(&gate, false)?;
     let child_context = execution
@@ -139,19 +191,19 @@ pub fn run(cli: &Cli, directory: &Path, key: &str, result_path: &Path) -> Result
                 .with_context(|| format!("could not save result {result_path:?}"))?;
         }
         apply_interrupt(&mut execution, result_path)?;
-        stage(&mut active, &cache::encode(&execution.record)?)?;
+        stage(&mut active, &execution, &votes)?;
         if apply_interrupt(&mut execution, result_path)? {
-            stage(&mut active, &cache::encode(&execution.record)?)?;
+            stage(&mut active, &execution, &votes)?;
         }
         fs::remove_file(&active_path).context("remove completed execution marker")?;
         if apply_interrupt(&mut execution, result_path)? {
-            stage(&mut active, &cache::encode(&execution.record)?)?;
+            stage(&mut active, &execution, &votes)?;
         }
         // Only this final byte publishes success. Shared data is temporary, so the
         // commit byte needs process visibility, not crash durability.
         active.seek(SeekFrom::Start(256))?;
-        active.write_all(&[0]).context("commit shared result")?;
-        Ok(execution.code)
+        active.write_all(&[3]).context("commit shared result")?;
+        Ok((execution.code, saving_status(&execution, &votes)))
     });
     let outcome = match child_context {
         Some(context) => outcome.context(context),
@@ -159,6 +211,8 @@ pub fn run(cli: &Cli, directory: &Path, key: &str, result_path: &Path) -> Result
     };
     if let Err(error) = &outcome {
         let invalidation = cache::invalidate(result_path);
+        let invalidated = invalidation.is_ok();
+        diagnostic.failed(if invalidated { "no" } else { "unknown" });
         let message = match invalidation {
             Ok(()) => format!("{error:#}"),
             Err(cleanup) => format!("{error:#}; could not invalidate result: {cleanup:#}"),
@@ -167,22 +221,65 @@ pub fn run(cli: &Cli, directory: &Path, key: &str, result_path: &Path) -> Result
         // error write leaves the pending tag, never a successful result.
         active.seek(SeekFrom::Start(257))?;
         active.set_len(257)?;
+        active.write_all(&[u8::from(invalidated)])?;
         active
             .write_all(message.as_bytes())
             .with_context(|| message.clone())?;
         active.seek(SeekFrom::Start(256))?;
-        active.write_all(&[1]).with_context(|| message.clone())?;
+        active.write_all(&[4]).with_context(|| message.clone())?;
         let _ = fs::remove_file(&active_path);
     }
     unlock(&active)?;
     unlock(&gate)?;
-    outcome
+    outcome.map(|(code, saved)| {
+        let (kind, saving) = match saved {
+            1 => ("completed", "yes"),
+            2 => ("completed", "no reason=participant-policy"),
+            _ => ("interrupted", "no reason=interrupted"),
+        };
+        diagnostic.finish(format!("{kind} exit={code} saved={saving}"));
+        code
+    })
 }
 
-fn stage(active: &mut File, bytes: &[u8]) -> Result<()> {
+fn replay(
+    record: cache::Record,
+    saving: &str,
+    interrupted: bool,
+    diagnostic: &Verbose,
+) -> Result<i32> {
+    let result = record.replay();
+    match &result {
+        Ok(code) => {
+            let kind = if interrupted || signals::received() != 0 {
+                "interrupted"
+            } else {
+                "completed"
+            };
+            diagnostic.finish(format!("{kind} exit={code} saved={saving}"));
+        }
+        Err(_) => diagnostic.finish(format!("failed saved={saving} reason=replay-failure")),
+    }
+    result
+}
+
+fn saving_status(execution: &runner::Execution, votes: &[u8; 256]) -> u8 {
+    if !execution.reusable {
+        3
+    } else if votes[execution.code as usize] != 0 {
+        1
+    } else {
+        2
+    }
+}
+
+fn stage(active: &mut File, execution: &runner::Execution, votes: &[u8; 256]) -> Result<()> {
     active.seek(SeekFrom::Start(257))?;
     active.set_len(257)?;
-    active.write_all(bytes).context("write shared result")?;
+    active.write_all(&[saving_status(execution, votes)])?;
+    active
+        .write_all(&cache::encode(&execution.record)?)
+        .context("write shared result")?;
     active.sync_all().context("sync shared result")
 }
 
