@@ -6,6 +6,7 @@ use std::{
     io::Write,
     os::unix::ffi::OsStrExt,
     path::Path,
+    sync::mpsc::{self, RecvTimeoutError},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -24,20 +25,29 @@ impl Record {
     }
     pub fn replay(self) -> Result<i32> {
         let code = self.code;
-        let writer = std::thread::spawn(move || self.replay_bytes());
+        let (completed, completion) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = completed.send(self.replay_bytes());
+        });
         loop {
             if crate::signals::received() != 0 {
                 // main exits immediately after this return; a blocked writer must not
                 // prevent cancellation or keep the process alive.
                 return Ok(128 + crate::signals::received());
             }
-            if writer.is_finished() {
-                writer
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("replay worker panicked"))??;
-                return Ok(code);
+            // Completion wakes immediately; the timeout only bounds signal latency
+            // while an output consumer has stopped reading.
+            match completion.recv_timeout(Duration::from_millis(10)) {
+                Ok(result) => {
+                    if crate::signals::received() != 0 {
+                        return Ok(128 + crate::signals::received());
+                    }
+                    result?;
+                    return Ok(code);
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => bail!("replay worker panicked"),
             }
-            std::thread::sleep(Duration::from_millis(10));
         }
     }
     fn replay_bytes(&self) -> Result<()> {
