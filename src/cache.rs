@@ -22,7 +22,25 @@ impl Record {
         now.duration_since(self.completed)
             .is_ok_and(|age| age <= ttl)
     }
-    pub fn replay(&self) -> Result<()> {
+    pub fn replay(self) -> Result<i32> {
+        let code = self.code;
+        let writer = std::thread::spawn(move || self.replay_bytes());
+        loop {
+            if crate::signals::received() != 0 {
+                // main exits immediately after this return; a blocked writer must not
+                // prevent cancellation or keep the process alive.
+                return Ok(128 + crate::signals::received());
+            }
+            if writer.is_finished() {
+                writer
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("replay worker panicked"))??;
+                return Ok(code);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    fn replay_bytes(&self) -> Result<()> {
         let mut out = std::io::stdout().lock();
         let mut err = std::io::stderr().lock();
         out.write_all(&self.stdout).context("replay stdout")?;
@@ -61,7 +79,7 @@ pub fn load(path: &Path) -> Result<Option<Record>> {
     decode(&bytes).context("corrupt cached result").map(Some)
 }
 
-fn decode(bytes: &[u8]) -> Result<Record> {
+pub fn decode(bytes: &[u8]) -> Result<Record> {
     if bytes.len() < 76 || &bytes[..8] != MAGIC {
         bail!("invalid header");
     }
@@ -99,7 +117,7 @@ pub fn invalidate(path: &Path) -> Result<()> {
     }
 }
 
-pub fn save(path: &Path, record: &Record) -> Result<()> {
+pub fn encode(record: &Record) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     bytes.extend(MAGIC);
     bytes.extend(
@@ -115,6 +133,11 @@ pub fn save(path: &Path, record: &Record) -> Result<()> {
     bytes.extend(&record.stdout);
     bytes.extend(&record.stderr);
     bytes.extend_from_slice(&Sha256::digest(&bytes));
+    Ok(bytes)
+}
+
+pub fn save(path: &Path, record: &Record) -> Result<()> {
+    let bytes = encode(record)?;
     let mut temporary =
         tempfile::NamedTempFile::new_in(path.parent().context("cache path has no parent")?)?;
     temporary.write_all(&bytes)?;

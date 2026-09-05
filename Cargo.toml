@@ -10,5 +10,6 @@ license = "MIT"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 humantime = "2"
+libc = "0.2"
 sha2 = "0.10"
 tempfile = "3"

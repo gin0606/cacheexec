@@ -80,6 +80,7 @@ dependencies = [
  "anyhow",
  "clap",
  "humantime",
+ "libc",
  "sha2",
  "tempfile",
 ]

@@ -3,21 +3,22 @@ use anyhow::{Context, Result, anyhow};
 use std::{
     ffi::OsString,
     io::{Read, Write},
-    os::unix::process::ExitStatusExt,
+    os::unix::process::{CommandExt, ExitStatusExt},
     process::{Command, Stdio},
+    sync::mpsc,
     thread,
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 pub struct Execution {
     pub code: i32,
-    pub record: Option<Record>,
+    pub record: Record,
+    pub reusable: bool,
 }
 
-fn copy(mut input: impl Read, mut output: impl Write) -> Result<Vec<u8>> {
+fn capture(mut input: impl Read, output: mpsc::Sender<Vec<u8>>) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     let mut buffer = [0; 16384];
-    let mut failure = None;
     loop {
         let count = match input.read(&mut buffer) {
             Ok(0) => break,
@@ -26,25 +27,23 @@ fn copy(mut input: impl Read, mut output: impl Write) -> Result<Vec<u8>> {
             Err(e) => return Err(e.into()),
         };
         bytes.extend_from_slice(&buffer[..count]);
-        // Keep draining after output failure so the child cannot block on a full pipe.
-        if failure.is_none() {
-            if let Err(error) = output
-                .write_all(&buffer[..count])
-                .and_then(|()| output.flush())
-            {
-                failure = Some(error);
-            }
-        }
-    }
-    if let Some(error) = failure {
-        return Err(error.into());
+        // A failed consumer must not stop draining the child's pipe.
+        let _ = output.send(buffer[..count].to_vec());
     }
     Ok(bytes)
+}
+fn stream(input: mpsc::Receiver<Vec<u8>>, mut output: impl Write) -> Result<()> {
+    for bytes in input {
+        output.write_all(&bytes)?;
+        output.flush()?;
+    }
+    Ok(())
 }
 
 pub fn execute(argv: &[OsString]) -> Result<Execution> {
     let mut child = Command::new(&argv[0])
         .args(&argv[1..])
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -52,17 +51,59 @@ pub fn execute(argv: &[OsString]) -> Result<Execution> {
         .with_context(|| format!("could not start {:?}", argv[0]))?;
     let stdout = child.stdout.take().context("missing child stdout pipe")?;
     let stderr = child.stderr.take().context("missing child stderr pipe")?;
+    let (out_sender, out_receiver) = mpsc::channel();
+    let (err_sender, err_receiver) = mpsc::channel();
+    let out_writer = thread::spawn(move || stream(out_receiver, std::io::stdout().lock()));
+    let err_writer = thread::spawn(move || stream(err_receiver, std::io::stderr().lock()));
     let (status, completed, out, err) = thread::scope(|scope| {
-        let out = scope.spawn(move || copy(stdout, std::io::stdout().lock()));
-        let err = scope.spawn(move || copy(stderr, std::io::stderr().lock()));
-        let status = child.wait();
-        let completed = SystemTime::now();
+        let out = scope.spawn(move || capture(stdout, out_sender));
+        let err = scope.spawn(move || capture(stderr, err_sender));
+        let mut completed = None;
+        let status = loop {
+            let signal = crate::signals::take_pending();
+            if signal != 0 {
+                // The child is not reaped until its pipes close, keeping its group ID reserved.
+                unsafe {
+                    libc::kill(-(child.id() as i32), signal);
+                }
+            }
+            if completed.is_none() {
+                match exited_without_reaping(child.id()) {
+                    Ok(true) => completed = Some(SystemTime::now()),
+                    Ok(false) => {}
+                    Err(error) => break Err(error),
+                }
+            }
+            if completed.is_some() && out.is_finished() && err.is_finished() {
+                break child.wait();
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
         (status, completed, out.join(), err.join())
     });
     let status = status.context("wait for child")?;
-    let code = status
-        .code()
-        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
+    while crate::signals::received() == 0 && !(out_writer.is_finished() && err_writer.is_finished())
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let interrupted = crate::signals::received();
+    if interrupted == 0 {
+        for writer in [out_writer, err_writer] {
+            writer
+                .join()
+                .map_err(|_| anyhow!("output writer panicked"))?
+                .with_context(|| {
+                    format!("child already completed with {status}; output transfer failed")
+                })?;
+        }
+    }
+    let code = if interrupted != 0 {
+        128 + interrupted
+    } else {
+        status
+            .code()
+            .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
+    };
     let context = || {
         format!(
             "child already completed with {}; output transfer failed",
@@ -77,11 +118,38 @@ pub fn execute(argv: &[OsString]) -> Result<Execution> {
         .map_err(|_| anyhow!("stderr worker panicked"))
         .and_then(|v| v)
         .with_context(context)?;
-    let record = status.code().map(|code| Record {
-        completed,
+    let reusable = status.code().is_some() && interrupted == 0;
+    let record = Record {
+        completed: completed.context("missing child completion time")?,
         code,
         stdout,
         stderr,
-    });
-    Ok(Execution { code, record })
+    };
+    Ok(Execution {
+        code,
+        record,
+        reusable,
+    })
+}
+
+fn exited_without_reaping(pid: u32) -> std::io::Result<bool> {
+    // WNOWAIT records exit promptly for TTL while reserving the process-group ID
+    // until output draining and signal forwarding have both finished.
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        if libc::waitid(
+            libc::P_PID,
+            pid,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        ) != 0
+        {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                return Ok(false);
+            }
+            return Err(error);
+        }
+        Ok(info.si_pid() != 0)
+    }
 }

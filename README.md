@@ -46,8 +46,32 @@ internal errors by their diagnostic. A signaled child returns **128 + signal**.
 If saving fails after execution, the diagnostic explicitly states that the child
 already completed and gives its exit code; the command is not repeated.
 
-Concurrent execution sharing, propagation of wrapper signals, and cache deletion
-are planned in the following implementation stages and are not yet supported.
+Simultaneous calls for the same key share one execution, including `--refresh`
+and calls with different TTLs or code selections. The execution owner streams
+output immediately; waiters receive complete stdout, stderr and status when it
+finishes, even if their code policy excludes that result. If any participant
+allows the normal exit code, it is saved for subsequent eligible calls. Otherwise
+it is held only for existing waiters. Each waiter keeps its own execution generation,
+so later executions cannot overwrite its result. Different keys run independently.
+A refresh already in progress takes precedence over the previous saved result.
+
+SIGINT/SIGTERM sent to the execution owner are forwarded to the child process group;
+all participants receive 128 + signal, and the result is not saved, even if the child
+handles the signal and exits normally. A signal sent only to a waiter ends that
+wait with 128 + signal and leaves the shared execution running. This also applies
+while replaying a completed result, even if the output consumer stops reading.
+Interrupting output delivery can truncate that invocation’s output or diagnostics. There is no child
+timeout: children that ignore these signals can continue to run. Descendants that
+leave the child process group are outside signal propagation guarantees.
+
+If the owner dies suddenly (including SIGKILL), waiters fail with a tool error
+without retrying. Kernel locks identify execution ownership, avoiding PID reuse
+checks. A subsequent invocation can start a new execution; any child orphaned by
+SIGKILL may still be running and is not automatically killed. Shared temporary
+results are unlinked on completion and stay accessible through existing waiters'
+open descriptors. An abandoned marker is reclaimed by the next same-key call.
+Do not remove or replace lock files while invocations are running. Filesystem or
+lock failures are explicit errors. Cache deletion is not yet supported.
 
 ## Development
 
