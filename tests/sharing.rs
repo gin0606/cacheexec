@@ -57,7 +57,10 @@ fn wait_until(mut condition: impl FnMut() -> bool) {
         thread::sleep(Duration::from_millis(10));
     }
 }
-fn finish(mut child: Child) -> Output {
+fn finish(child: Child) -> Output {
+    finish_with_context(child, "child")
+}
+fn finish_with_context(mut child: Child, context: &str) -> Output {
     let end = Instant::now() + Duration::from_secs(10);
     loop {
         if child.try_wait().unwrap().is_some() {
@@ -65,7 +68,7 @@ fn finish(mut child: Child) -> Output {
         }
         if Instant::now() >= end {
             let _ = child.kill();
-            panic!("child timed out");
+            panic!("{context} timed out");
         }
         thread::sleep(Duration::from_millis(10));
     }
@@ -805,16 +808,26 @@ fn verbose_late_waiter_keeps_its_generation_saving_status() {
 
 #[test]
 fn verbose_owner_and_waiter_interruptions_preserve_uncertainty() {
+    let interruptible = "trap 'exit 130' INT; trap 'exit 143' TERM; printf x >> count; while ! test -f go; do sleep 0.01; done; exit 7";
     for sig in [libc::SIGINT, libc::SIGTERM] {
         for interrupt_owner in [false, true] {
             let f = Fixture::new();
-            let owner = f.spawn(&["--verbose", "--include-codes", "7"], QUIET);
+            let owner = f.spawn(&["--verbose", "--include-codes", "7"], interruptible);
             f.started();
-            let mut waiter = f.spawn(&["--verbose", "--include-codes", "1"], QUIET);
+            let mut waiter = f.spawn(&["--verbose", "--include-codes", "1"], interruptible);
             f.joined(1);
             decision_before_completion(&mut waiter, "join");
             signal(if interrupt_owner { &owner } else { &waiter }, sig);
-            let waited = finish(waiter);
+            let case = format!(
+                "waiter after {} to {}",
+                if sig == libc::SIGINT {
+                    "SIGINT"
+                } else {
+                    "SIGTERM"
+                },
+                if interrupt_owner { "owner" } else { "waiter" }
+            );
+            let waited = finish_with_context(waiter, &case);
             assert_eq!(waited.status.code(), Some(128 + sig));
             let text = verbose_text(&waited);
             assert!(text.contains(&format!("interrupted exit={}", 128 + sig)));
@@ -827,7 +840,7 @@ fn verbose_owner_and_waiter_interruptions_preserve_uncertainty() {
                 "{text}"
             );
             f.release();
-            let owned = finish(owner);
+            let owned = finish_with_context(owner, "owner after release");
             assert_eq!(
                 owned.status.code(),
                 Some(if interrupt_owner { 128 + sig } else { 7 })
@@ -1115,13 +1128,13 @@ fn owner_delivery_failure_does_not_fail_waiters_or_discard_cache() {
         let script = "printf x >> count; while ! test -f go; do sleep 0.01; done; printf out; printf err >&2";
         let mut owner = f.spawn(&["--include-codes", "0"], script);
         f.started();
-        let waiter = f.spawn(&["--include-codes", "1"], script);
-        f.joined(1);
         if stderr {
             drop(owner.stderr.take());
         } else {
             drop(owner.stdout.take());
         }
+        let waiter = f.spawn(&["--include-codes", "1"], script);
+        f.joined(1);
         f.release();
         assert_eq!(finish(owner).status.code(), Some(125));
         for result in [finish(waiter), finish(f.spawn(&[], script))] {
