@@ -100,7 +100,9 @@ pub fn run(cli: &Cli, directory: &Path, key: &str, result_path: &Path) -> Result
     let previous = cache::load(result_path)?;
     if !cli.refresh {
         if let Some(record) = previous {
-            if record.fresh(cli.ttl, SystemTime::now()) && cli.allows(record.code) {
+            if record.fresh(cli.ttl.expect("execution requires TTL"), SystemTime::now())
+                && cli.allows(record.code)
+            {
                 unlock(&gate)?;
                 return record.replay();
             }

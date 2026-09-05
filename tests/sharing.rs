@@ -493,3 +493,83 @@ fn interruption_with_storage_error_does_not_block_on_stderr_diagnostic() {
     signal(&owner, libc::SIGTERM);
     assert_eq!(finish(owner).status.code(), Some(125));
 }
+
+#[test]
+fn cleanup_preserves_running_refresh_and_undelivered_waiter_generation() {
+    use std::os::fd::AsRawFd;
+    let f = Fixture::new();
+    let clear = || {
+        Command::new(env!("CARGO_BIN_EXE_cacheexec"))
+            .arg("--cache-dir")
+            .arg(f.root.path().join("cache"))
+            .arg("--clear")
+            .output()
+            .unwrap()
+    };
+    f.release();
+    assert_eq!(finish(f.spawn(&[], SCRIPT)).status.code(), Some(7));
+    fs::remove_file(f.root.path().join("go")).unwrap();
+    let owner = f.spawn(&["--refresh", "--include-codes", "7"], SCRIPT);
+    wait_until(|| f.count() == "xx");
+    let waiter = f.spawn(&["--include-codes", "1"], SCRIPT);
+    f.joined(1);
+    let gate_path = fs::read_dir(f.root.path().join("cache"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "lock"))
+        .unwrap();
+    let gate = fs::OpenOptions::new().write(true).open(&gate_path).unwrap();
+    assert_eq!(unsafe { libc::flock(gate.as_raw_fd(), libc::LOCK_EX) }, 0);
+    signal(&waiter, libc::SIGSTOP);
+    assert!(String::from_utf8_lossy(&clear().stdout).contains("skipped=1"));
+    assert_eq!(unsafe { libc::flock(gate.as_raw_fd(), libc::LOCK_UN) }, 0);
+    assert!(String::from_utf8_lossy(&clear().stdout).contains("skipped=1"));
+    f.release();
+    let first = finish(owner);
+    assert!(String::from_utf8_lossy(&clear().stdout).contains("removed=1"));
+    assert!(gate_path.exists());
+    let next = finish(f.spawn(&[], SCRIPT));
+    signal(&waiter, libc::SIGCONT);
+    let replay = finish(waiter);
+    assert_eq!(replay.stdout, first.stdout);
+    assert_eq!(replay.stderr, first.stderr);
+    assert_eq!(replay.status.code(), Some(7));
+    assert_eq!(next.status.code(), Some(7));
+    assert_eq!(finish(f.spawn(&[], SCRIPT)).status.code(), Some(7));
+    assert_eq!(f.count(), "xxx");
+}
+
+#[test]
+fn cleanup_reclaims_abandoned_marker_without_retrying_waiter() {
+    use std::os::fd::AsRawFd;
+    let f = Fixture::new();
+    let owner = f.spawn(&["--include-codes", "0"], SCRIPT);
+    f.started();
+    let waiter = f.spawn(&["--include-codes", "1"], SCRIPT);
+    f.joined(1);
+    let gate_path = fs::read_dir(f.root.path().join("cache"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "lock"))
+        .unwrap();
+    let gate = fs::OpenOptions::new().write(true).open(gate_path).unwrap();
+    assert_eq!(unsafe { libc::flock(gate.as_raw_fd(), libc::LOCK_EX) }, 0);
+    signal(&waiter, libc::SIGSTOP);
+    assert_eq!(unsafe { libc::flock(gate.as_raw_fd(), libc::LOCK_UN) }, 0);
+    signal(&owner, libc::SIGKILL);
+    finish(owner);
+    let clear = Command::new(env!("CARGO_BIN_EXE_cacheexec"))
+        .arg("--cache-dir")
+        .arg(f.root.path().join("cache"))
+        .arg("--clear")
+        .output()
+        .unwrap();
+    assert!(clear.status.success());
+    assert!(String::from_utf8_lossy(&clear.stdout).contains("abandoned=1"));
+    signal(&waiter, libc::SIGCONT);
+    assert_eq!(finish(waiter).status.code(), Some(125));
+    assert_eq!(f.count(), "x");
+    f.release();
+    assert_eq!(finish(f.spawn(&[], SCRIPT)).status.code(), Some(7));
+    assert_eq!(f.count(), "xx");
+}

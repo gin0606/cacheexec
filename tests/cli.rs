@@ -283,3 +283,124 @@ fn xdg_and_home_defaults_and_required_arguments() {
         );
     }
 }
+
+#[test]
+fn clear_all_age_directory_isolation_and_condition_fixture() {
+    for code in [0, 1, 7] {
+        let f = Fixture::new();
+        let run = || {
+            f.command()
+                .env("CODE", code.to_string())
+                .args([
+                    "--ttl",
+                    "5m",
+                    "--include-codes",
+                    "0,1",
+                    "--",
+                    "sh",
+                    "-c",
+                    SCRIPT,
+                ])
+                .output()
+                .unwrap()
+        };
+        assert_eq!(run().status.code(), Some(code));
+        assert_eq!(run().status.code(), Some(code));
+        assert_eq!(f.count(), if code == 7 { "xx" } else { "x" });
+        let recent = f
+            .command()
+            .args(["--clear", "--older-than", "1h"])
+            .output()
+            .unwrap();
+        assert!(recent.status.success());
+        assert!(String::from_utf8_lossy(&recent.stdout).contains("removed=0"));
+        let other = Command::new(env!("CARGO_BIN_EXE_cacheexec"))
+            .arg("--cache-dir")
+            .arg(f.root.path().join("other"))
+            .arg("--clear")
+            .output()
+            .unwrap();
+        assert!(other.status.success());
+        assert!(!f.root.path().join("other").exists());
+        let clear = f.command().arg("--clear").output().unwrap();
+        assert!(clear.status.success());
+        assert!(
+            String::from_utf8_lossy(&clear.stdout).contains(if code == 7 {
+                "removed=0"
+            } else {
+                "removed=1"
+            })
+        );
+        assert_eq!(run().status.code(), Some(code));
+        assert_eq!(f.count(), if code == 7 { "xxx" } else { "xx" });
+        let expired = f
+            .command()
+            .args(["--clear", "--older-than", "0s"])
+            .output()
+            .unwrap();
+        assert!(expired.status.success());
+        assert!(
+            !fs::read_dir(f.root.path().join("cache"))
+                .unwrap()
+                .any(|entry| entry
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|e| e == "result"))
+        );
+    }
+}
+
+#[test]
+fn clear_reports_partial_failure_and_preserves_corruption() {
+    let f = Fixture::new();
+    f.run(&["--ttl", "1h"], "true");
+    let broken = f
+        .root
+        .path()
+        .join("cache")
+        .join(format!("{}.result", "0".repeat(64)));
+    fs::write(&broken, "corrupt").unwrap();
+    let output = f.command().arg("--clear").output().unwrap();
+    assert_eq!(output.status.code(), Some(125));
+    let diagnostic = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        diagnostic.contains("removed=1")
+            && diagnostic.contains("failed=1")
+            && diagnostic.contains("corrupt")
+    );
+    assert!(broken.exists());
+    fs::remove_file(&broken).unwrap();
+    fs::create_dir(&broken).unwrap();
+    assert_eq!(
+        f.command().arg("--clear").output().unwrap().status.code(),
+        Some(125)
+    );
+    for args in [
+        vec!["--clear", "--ttl", "1h"],
+        vec!["--older-than", "1h"],
+        vec!["--clear", "--", "true"],
+    ] {
+        assert_eq!(
+            f.command().args(args).output().unwrap().status.code(),
+            Some(2)
+        );
+    }
+}
+
+#[test]
+fn clear_permission_failure_is_explicit() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let f = Fixture::new();
+    f.run(&["--ttl", "1h"], "true");
+    let directory = f.root.path().join("cache");
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o555)).unwrap();
+    let output = f.command().arg("--clear").output().unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(output.status.code(), Some(125));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("delete cached result"));
+    assert!(f.result().exists());
+}

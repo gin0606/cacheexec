@@ -5,7 +5,7 @@ Cache the stdout, stderr and exit code of a non-interactive command on macOS and
 ```sh
 cargo install --path . --locked
 cacheexec --ttl 5m -- curl -fsS https://example.com/status
-cacheexec --ttl 30s --include-codes 0,1 -- sh -c './condition-check.sh'
+cacheexec --ttl 5m --include-codes 0,1 -- sh -c './condition-check.sh'
 cacheexec --ttl 5m --key "$DEPLOY_ENV" --refresh -- ./query
 ```
 
@@ -16,7 +16,7 @@ and stderr while running. A hit skips execution and replays each byte stream and
 the original exit code. Non-UTF-8 bytes are preserved. Stream timing and ordering
 between stdout and stderr are not preserved on replay. No hit/miss logs are added.
 
-`--ttl` is required and accepts durations such as `500ms`, `30s`, `5m`, and `1h`.
+`--ttl` is required for command execution and accepts durations such as `500ms`, `30s`, `5m`, and `1h`.
 Age is measured from execution completion and is reusable at age **<= TTL**.
 `0s` effectively requests a new execution. A clock earlier than the completion
 time makes the result ineligible. Changing TTL uses the same key.
@@ -71,7 +71,37 @@ SIGKILL may still be running and is not automatically killed. Shared temporary
 results are unlinked on completion and stay accessible through existing waiters'
 open descriptors. An abandoned marker is reclaimed by the next same-key call.
 Do not remove or replace lock files while invocations are running. Filesystem or
-lock failures are explicit errors. Cache deletion is not yet supported.
+lock failures are explicit errors. Use the cleanup options below for deletion.
+
+## Explicit cleanup
+
+```sh
+cacheexec --cache-dir ./cache --clear
+cacheexec --cache-dir ./cache --clear --older-than 24h
+```
+
+Cleanup takes no command or TTL. `--clear` deletes all idle reusable results;
+`--older-than` restricts deletion to completion ages strictly greater than the
+specified duration (the boundary and future timestamps are retained). This age is
+independent of any reader's TTL. Cleanup scans once; keys created concurrently may
+remain for the next cleanup. There is no automatic cleanup or background service.
+
+The summary reports removed results, reclaimed abandoned execution markers, skipped
+busy keys, and failures. Busy keys are skipped successfully, so run cleanup again
+later if needed. Active executions and undelivered waiter generations are preserved,
+even across refresh and new executions. Missing directories succeed without creating
+them. Corruption, permissions and deletion failures exit 125 with a diagnostic and
+partial counts; successful deletions are not rolled back. Corrupt results are kept
+for inspection. Stable `.lock` files are deliberately retained to avoid splitting
+concurrent callers across different lock inodes. Anonymous save temporary files and
+unrecognized files are retained because cleanup cannot safely identify their owner;
+remove such leftovers manually only after all cacheexec invocations have stopped.
+Never recursively delete the cache directory while invocations are running.
+
+For a condition script, use `--ttl 5m --include-codes 0,1 -- sh -c
+'./condition-check.sh'`. Codes 0 and 1 are reusable, while other codes and their
+stderr are returned each time. cacheexec attaches no application meaning to codes.
+After clearing the saved result, the next call runs the script again.
 
 ## Development
 
