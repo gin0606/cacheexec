@@ -8,13 +8,25 @@ cacheexecは、APIへの問い合わせ、条件判定、ビルドやデプロ�
 
 ## インストール
 
-開発時は、ローカルのソースツリーからcacheexecをインストールします。
+Homebrewを使う場合:
 
 ```sh
-cargo install --path . --locked
+brew install gin0606/tap/cacheexec
 ```
 
-配布方法と一般利用者向けのインストール手順は、まだ確定していません。
+Nixを使う場合:
+
+```sh
+nix profile install github:gin0606/cacheexec
+```
+
+または、タグの付いたソースをCargoでビルドします。
+
+```sh
+cargo install --git https://github.com/gin0606/cacheexec --locked
+```
+
+開発時は、ローカルのソースツリーから`cargo install --path . --locked`でインストールできます。
 
 ## クイックスタート
 
@@ -142,3 +154,8 @@ cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 ```
+
+`nix flake check`でNix packageをビルド・テストできます。リリースには
+`Cargo.toml`のversionを使い、同じversionの`vX.Y.Z`タグをpushすると各platformの
+archiveを公開して`gin0606/homebrew-tap`を更新します。commit済みで変更のない
+`main` branchでは、`just release`がrepositoryを検証して対応するタグをpushします。

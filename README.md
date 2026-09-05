@@ -8,13 +8,25 @@ cacheexec is a small tool for reusing the result of commands that are expensive 
 
 ## Installation
 
-For development, install cacheexec from a local checkout:
+With Homebrew:
 
 ```sh
-cargo install --path . --locked
+brew install gin0606/tap/cacheexec
 ```
 
-Distribution and end-user installation instructions have not been finalized yet.
+With Nix:
+
+```sh
+nix profile install github:gin0606/cacheexec
+```
+
+Or build the tagged source with Cargo:
+
+```sh
+cargo install --git https://github.com/gin0606/cacheexec --locked
+```
+
+For development, install from a local checkout with `cargo install --path . --locked`.
 
 ## Quick start
 
@@ -142,3 +154,8 @@ cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 ```
+
+`nix flake check` builds and tests the Nix package. Releases use the version in
+`Cargo.toml`; pushing the matching `vX.Y.Z` tag publishes the platform archives
+and updates `gin0606/homebrew-tap`. From a clean, committed `main` branch,
+`just release` validates the repository and pushes that tag.

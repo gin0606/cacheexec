@@ -1,0 +1,306 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt, clippy
+
+      - name: Check the tag and manifest version
+        id: version
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "tag $GITHUB_REF_NAME must have the form vx.y.z" >&2
+            exit 1
+          fi
+          cargo_version="$(cargo pkgid | sed 's/.*[#@]//')"
+          if [ "$version" != "$cargo_version" ]; then
+            echo "tag version $version does not match Cargo.toml version $cargo_version" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "the release tag must point to a commit on main" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # Fail before the platform builds if the shared tap credentials are unavailable.
+      - name: Check the tap credentials
+        uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: gin0606
+          repositories: homebrew-tap
+
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  build:
+    needs: validate
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            install_musl: true
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            install_musl: true
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            install_musl: false
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            install_musl: false
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install the musl linker
+        if: matrix.install_musl
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+
+      - name: Build the binary
+        run: cargo build --locked --release --target "${{ matrix.target }}"
+
+      - name: Package the binary
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        shell: bash
+        run: |
+          directory="cacheexec-v${VERSION}-${TARGET}"
+          mkdir "$directory"
+          cp "target/${TARGET}/release/cacheexec" "$directory/"
+          cp LICENSE README.md "$directory/"
+          tar -czf "$directory.tar.gz" "$directory"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cacheexec-${{ matrix.target }}
+          path: cacheexec-v${{ needs.validate.outputs.version }}-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: [validate, build]
+    runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: cacheexec-*
+          path: artifacts
+          merge-multiple: true
+
+      - uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
+        id: app-token
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: gin0606
+          repositories: homebrew-tap
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: gin0606/homebrew-tap
+          token: ${{ steps.app-token.outputs.token }}
+          path: tap
+
+      - name: Refuse to supersede a newer formula
+        working-directory: tap
+        shell: bash
+        run: |
+          if [ ! -f cacheexec.rb ]; then
+            exit 0
+          fi
+          current="$(sed -n 's/^  version "\(.*\)"$/\1/p' cacheexec.rb)"
+          if [ -z "$current" ]; then
+            echo "could not read the current cacheexec formula version" >&2
+            exit 1
+          fi
+          newest="$(printf '%s\n%s\n' "$current" "$VERSION" | sort -V | tail -1)"
+          if [ "$current" != "$VERSION" ] && [ "$newest" = "$current" ]; then
+            echo "the tap already contains newer version $current" >&2
+            exit 1
+          fi
+
+      # Draft assets may be replaced safely. A rerun after publication reuses the
+      # published bytes so the tap can never advertise a different checksum.
+      - name: Upload or recover the release assets
+        id: assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        shell: bash
+        run: |
+          expected=(
+            "cacheexec-v${VERSION}-aarch64-apple-darwin.tar.gz"
+            "cacheexec-v${VERSION}-aarch64-unknown-linux-musl.tar.gz"
+            "cacheexec-v${VERSION}-x86_64-apple-darwin.tar.gz"
+            "cacheexec-v${VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          )
+
+          state=missing
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            if [ "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq '.isDraft')" = true ]; then
+              state=draft
+            else
+              state=published
+            fi
+          fi
+
+          if [ "$state" = published ]; then
+            if [ "$RUN_ATTEMPT" = 1 ]; then
+              echo "$GITHUB_REF_NAME is already published outside this workflow run" >&2
+              exit 1
+            fi
+            mkdir published
+            for name in "${expected[@]}"; do
+              gh release download "$GITHUB_REF_NAME" --pattern "$name" --dir published
+            done
+            asset_dir=published
+          else
+            if [ "$state" = missing ]; then
+              gh release create "$GITHUB_REF_NAME" --draft --generate-notes
+            fi
+            for name in "${expected[@]}"; do
+              test -s "artifacts/$name"
+              gh release upload "$GITHUB_REF_NAME" "artifacts/$name" --clobber
+            done
+            asset_dir=artifacts
+          fi
+
+          for name in "${expected[@]}"; do
+            test -s "$asset_dir/$name"
+          done
+          echo "directory=$asset_dir" >> "$GITHUB_OUTPUT"
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+
+      - name: Calculate release checksums
+        id: checksum
+        env:
+          ASSET_DIR: ${{ steps.assets.outputs.directory }}
+        shell: bash
+        run: |
+          checksum() {
+            sha256sum "$ASSET_DIR/$1" | cut -d ' ' -f 1
+          }
+          {
+            echo "darwin_arm64=$(checksum "cacheexec-v${VERSION}-aarch64-apple-darwin.tar.gz")"
+            echo "darwin_x86_64=$(checksum "cacheexec-v${VERSION}-x86_64-apple-darwin.tar.gz")"
+            echo "linux_arm64=$(checksum "cacheexec-v${VERSION}-aarch64-unknown-linux-musl.tar.gz")"
+            echo "linux_x86_64=$(checksum "cacheexec-v${VERSION}-x86_64-unknown-linux-musl.tar.gz")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Generate the Homebrew formula
+        working-directory: tap
+        env:
+          DARWIN_ARM64: ${{ steps.checksum.outputs.darwin_arm64 }}
+          DARWIN_X86_64: ${{ steps.checksum.outputs.darwin_x86_64 }}
+          LINUX_ARM64: ${{ steps.checksum.outputs.linux_arm64 }}
+          LINUX_X86_64: ${{ steps.checksum.outputs.linux_x86_64 }}
+        shell: bash
+        run: |
+          cat > cacheexec.rb <<EOF
+          class Cacheexec < Formula
+            desc "Cache non-interactive command output and exit status"
+            homepage "https://github.com/gin0606/cacheexec"
+            version "$VERSION"
+            license "MIT"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "https://github.com/gin0606/cacheexec/releases/download/v#{version}/cacheexec-v#{version}-aarch64-apple-darwin.tar.gz"
+                sha256 "$DARWIN_ARM64"
+              elsif Hardware::CPU.intel?
+                url "https://github.com/gin0606/cacheexec/releases/download/v#{version}/cacheexec-v#{version}-x86_64-apple-darwin.tar.gz"
+                sha256 "$DARWIN_X86_64"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm? && Hardware::CPU.is_64_bit?
+                url "https://github.com/gin0606/cacheexec/releases/download/v#{version}/cacheexec-v#{version}-aarch64-unknown-linux-musl.tar.gz"
+                sha256 "$LINUX_ARM64"
+              elsif Hardware::CPU.intel? && Hardware::CPU.is_64_bit?
+                url "https://github.com/gin0606/cacheexec/releases/download/v#{version}/cacheexec-v#{version}-x86_64-unknown-linux-musl.tar.gz"
+                sha256 "$LINUX_X86_64"
+              end
+            end
+
+            def install
+              bin.install "cacheexec"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/cacheexec --version")
+            end
+          end
+          EOF
+          ruby -c cacheexec.rb
+
+      - name: Publish the release
+        if: steps.assets.outputs.state != 'published'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false
+
+      # Publishing first prevents the tap from ever pointing at inaccessible assets.
+      - name: Push the Homebrew formula
+        working-directory: tap
+        shell: bash
+        run: |
+          git add cacheexec.rb
+          if git diff --cached --quiet; then
+            echo "the tap already points at this release"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Update cacheexec formula to $GITHUB_REF_NAME"
+
+          pushed=""
+          for _ in 1 2 3; do
+            git rebase --abort 2>/dev/null || true
+            if git pull --rebase && git push; then
+              pushed=yes
+              break
+            fi
+            sleep 5
+          done
+          if [ -z "$pushed" ]; then
+            echo "could not push the Homebrew formula" >&2
+            exit 1
+          fi

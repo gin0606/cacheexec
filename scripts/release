@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$(git branch --show-current)" != "main" ]; then
+  echo "release must run on main" >&2
+  exit 1
+fi
+
+if [ -n "$(git status --porcelain)" ]; then
+  echo "release requires a clean worktree; commit the release version first" >&2
+  exit 1
+fi
+
+git fetch origin main --tags
+
+if ! git merge-base --is-ancestor origin/main HEAD; then
+  echo "main has diverged from or is behind origin/main" >&2
+  exit 1
+fi
+
+cargo_bin="${CARGO:-}"
+rustup_cargo="${CARGO_HOME:-${HOME:-}/.cargo}/bin/cargo"
+if [ -z "$cargo_bin" ] && [ -x "$rustup_cargo" ]; then
+  cargo_bin="$rustup_cargo"
+fi
+if [ -z "$cargo_bin" ]; then
+  cargo_bin="$(command -v cargo)"
+fi
+
+version="$("$cargo_bin" pkgid | sed 's/.*[#@]//')"
+if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+  echo "Cargo.toml version must have the form x.y.z, got: $version" >&2
+  exit 1
+fi
+tag="v$version"
+
+if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+  echo "$tag already exists on origin" >&2
+  exit 1
+else
+  remote_tag_status=$?
+fi
+if [ "$remote_tag_status" -ne 2 ]; then
+  echo "could not check whether $tag exists on origin" >&2
+  exit "$remote_tag_status"
+fi
+
+./scripts/check
+
+if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+  if [ "$(git rev-list -n 1 "$tag")" != "$(git rev-parse HEAD)" ]; then
+    echo "local $tag does not point at HEAD" >&2
+    exit 1
+  fi
+else
+  git tag -a "$tag" -m "Release $version"
+fi
+
+git push --atomic origin HEAD:main "refs/tags/$tag"

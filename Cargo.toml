@@ -5,6 +5,9 @@ edition = "2024"
 rust-version = "1.85"
 description = "Cache non-interactive command output and exit status"
 license = "MIT"
+repository = "https://github.com/gin0606/cacheexec"
+readme = "README.md"
+publish = false
 
 [dependencies]
 anyhow = "1"
