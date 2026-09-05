@@ -543,13 +543,13 @@ fn interruption_with_storage_error_does_not_block_on_stderr_diagnostic() {
     let script = "printf x >> count; (dd if=/dev/zero bs=131072 count=1 2>/dev/null) >&2; printf done > finished";
     let owner = f.spawn(&[], script);
     f.started();
-    wait_until(|| f.root.path().join("finished").exists());
     let active = fs::read_dir(f.root.path().join("cache"))
         .unwrap()
         .map(|e| e.unwrap().path())
         .find(|p| p.extension().is_some_and(|s| s == "active"))
         .unwrap();
     fs::create_dir(active.with_extension("result")).unwrap();
+    wait_until(|| f.root.path().join("finished").exists());
     signal(&owner, libc::SIGTERM);
     assert_eq!(finish(owner).status.code(), Some(125));
 }
