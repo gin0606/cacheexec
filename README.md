@@ -4,12 +4,19 @@
 
 Cache the stdout, stderr and exit code of a non-interactive command on macOS and Linux.
 
+## Quick start
+
 ```sh
 cargo install --path . --locked
-cacheexec --ttl 5m -- curl -fsS https://example.com/status
+cacheexec --ttl 5m --include-codes 0 -- curl -fsS https://example.com/status
 cacheexec --ttl 5m --include-codes 0,1 -- sh -c './condition-check.sh'
 cacheexec --ttl 5m --key "$DEPLOY_ENV" --refresh -- ./query
 ```
+
+**Nonzero exit codes are cached by default.** To avoid reusing transient failures,
+use `--include-codes 0`, as in the curl example above.
+
+## Command execution and output
 
 The command **must follow `--`**. Arguments are executed directly without shell
 interpretation; explicitly use `sh -c` for pipelines, redirects or expansions.
@@ -17,6 +24,8 @@ The child inherits the environment, receives closed stdin, and streams its stdou
 and stderr while running. A hit skips execution and replays each byte stream and
 the original exit code. Non-UTF-8 bytes are preserved. Stream timing and ordering
 between stdout and stderr are not preserved on replay. No hit/miss logs are added.
+
+## TTL, exit-code selection and refresh
 
 `--ttl` is required for command execution and accepts durations such as `500ms`, `30s`, `5m`, and `1h`.
 Age is measured from execution completion and is reusable at age **<= TTL**.
@@ -30,6 +39,8 @@ Start failures and signal termination are never saved. `--refresh` invalidates
 the previous result before starting again. Ineligible, failed or interrupted
 updates never restore old results. Commands are never automatically retried.
 
+## Keys and storage
+
 Keys include the exact command/argument boundaries, working directory, and optional
 `--key`. Environment, executable contents, and input file contents are **not**
 automatically tracked: use an additional key or refresh when they change.
@@ -40,6 +51,15 @@ local files; completed results are checksummed and atomically published. Each ke
 has one latest result. Outputs are buffered in memory; size them to available RAM.
 Network filesystem guarantees, interactive commands and PTYs are out of scope.
 
+## Exit codes and errors
+
+| Outcome | Exit code |
+|---|---|
+| Normal child exit | Child code (0–255) |
+| Signal interruption | 128 + signal |
+| Tool error | 125, with a `cacheexec:` diagnostic |
+| Invalid arguments | 2 |
+
 Missing results are cache misses. Corrupt/inaccessible storage, including during
 refresh, is a tool error rather than a silent cache bypass. Tool errors print a
 `cacheexec:` diagnostic to stderr and exit **125**. Argument errors exit **2**.
@@ -47,6 +67,8 @@ A normally terminated child returns its own code (including 2 or 125); distingui
 internal errors by their diagnostic. A signaled child returns **128 + signal**.
 If saving fails after execution, the diagnostic explicitly states that the child
 already completed and gives its exit code; the command is not repeated.
+
+## Concurrent execution and interruption
 
 Simultaneous calls for the same key share one execution, including `--refresh`
 and calls with different TTLs or code selections. The execution owner streams

@@ -44,6 +44,27 @@ const SCRIPT: &str =
     "printf x >> count; printf '\\377\\000out'; printf '\\376err' >&2; exit ${CODE:-0}";
 
 #[test]
+fn missing_separator_suggests_command_syntax_without_masking_option_errors() {
+    let f = Fixture::new();
+    let output = f
+        .command()
+        .args(["--ttl", "5m", "echo", "hello"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("put -- before the command"));
+    let output = f
+        .command()
+        .args(["--ttl", "5m", "--refersh"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let diagnostic = String::from_utf8_lossy(&output.stderr);
+    assert!(diagnostic.contains("--refersh"));
+    assert!(!diagnostic.contains("put -- before the command"));
+}
+
+#[test]
 fn hit_replays_binary_streams_and_all_exit_codes() {
     for code in [0, 1, 23, 125, 255] {
         let f = Fixture::new();

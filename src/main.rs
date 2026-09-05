@@ -5,14 +5,44 @@ mod sharing;
 mod signals;
 
 use anyhow::{Context, Result, bail};
-use clap::Parser;
+use clap::{
+    Parser,
+    error::{ContextKind, ContextValue, ErrorKind},
+};
 use std::{ffi::OsString, path::PathBuf, time::Duration};
 
 #[derive(Debug, Parser)]
 #[command(
     version,
     about = "Cache non-interactive command output and exit status",
-    after_help = "Runs argv directly with closed stdin and inherited environment. Use -- sh -c '...' for shell syntax. TTL is measured from completion (e.g. 500ms, 5m, 1h). Exit codes: child code on success, 128+signal for a signaled child, 125 with a cacheexec: diagnostic for tool errors (including post-execution save failures). Cache defaults to $XDG_CACHE_HOME/cacheexec or $HOME/.cache/cacheexec on macOS and Linux. Environment changes are not automatically keyed; use --key or --refresh. Concurrent calls share one execution even with different policies or --refresh. Waiters replay the completed result. SIGINT/SIGTERM interrupt only a waiter, or propagate from the execution owner to its child process group. Owner death fails waiters without retry. Cleanup: --clear [--older-than 24h] takes no command or TTL, reports removed/abandoned/skipped/failed counts, and skips busy keys. Missing directories succeed; partial failures exit 125. Age is strictly greater than the cleanup duration, independently of TTL. Stable locks and unidentified temporary files remain; no automatic cleanup. No execution timeout. Output is binary-safe; timing and ordering between stdout and stderr are not preserved on replay."
+    after_help = "Examples:
+  cacheexec --ttl 5m --include-codes 0 -- curl -fsS https://example.com/status
+  cacheexec --ttl 5m --include-codes 0,1 -- sh -c './condition-check.sh'
+  cacheexec --clear --older-than 24h
+
+Execution:
+  Put -- before the command. Arguments run directly; stdin is closed.
+  All normal exit codes, including nonzero codes, are cached by default.
+  TTL starts at completion (500ms, 5m, 1h). Environment changes are not keyed.
+  Same-key calls share execution, including --refresh and different policies.
+  Output is binary-safe; replay does not preserve timing between streams.
+  SIGINT/SIGTERM cancel waiters or reach the owner's child process group.
+  Owner death fails waiters without retry. No execution timeout.
+
+Exit codes:
+  0..255       Child's normal exit code
+  128+signal   Interrupted execution or waiter
+  125          Tool error, with a cacheexec: diagnostic
+  2            Invalid arguments
+  Child codes can also be 2 or 125; distinguish tool errors by diagnostics.
+
+Storage and cleanup:
+  $XDG_CACHE_HOME/cacheexec or $HOME/.cache/cacheexec; override with --cache-dir.
+  --clear takes no command or TTL and skips busy keys. --older-than uses
+  completion age strictly greater than its duration, independently of TTL.
+  Cleanup reports counts; partial failures exit 125. Locks and unidentified
+  temporary files remain. No automatic cleanup.
+  See README.md / README.ja.md for recovery steps and full behavior."
 )]
 struct Cli {
     /// Maximum result age since completion (required, including for refresh)
@@ -84,8 +114,24 @@ fn default_cache_dir() -> Result<PathBuf> {
     bail!("neither XDG_CACHE_HOME nor HOME is set; supply --cache-dir")
 }
 
+fn parse_cli() -> Cli {
+    Cli::try_parse().unwrap_or_else(|mut error| {
+        if error.kind() == ErrorKind::UnknownArgument
+            && matches!(error.get(ContextKind::InvalidArg), Some(ContextValue::String(arg)) if !arg.starts_with('-'))
+        {
+            error.insert(
+                ContextKind::Suggested,
+                ContextValue::StyledStrs(vec![
+                    "put -- before the command, for example: cacheexec --ttl 5m -- echo hello".into(),
+                ]),
+            );
+        }
+        error.exit()
+    })
+}
+
 fn main() {
-    let code = match signals::install().and_then(|()| run(Cli::parse())) {
+    let code = match signals::install().and_then(|()| run(parse_cli())) {
         Ok(code) => code,
         Err(error) => {
             let diagnostic = std::thread::spawn(move || eprintln!("cacheexec: {error:#}"));
