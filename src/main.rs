@@ -20,7 +20,7 @@ use std::{ffi::OsString, path::PathBuf, time::Duration};
        cacheexec --clear [--older-than <DURATION>] [--cache-dir <PATH>]",
     after_help = "Examples:
   cacheexec --ttl 5m --include-codes 0 -- curl -fsS https://example.com/status
-  cacheexec --ttl 5m --include-codes 0,1 -- sh -c './condition-check.sh'
+  cacheexec --ttl 5m --include-codes 0,1 -- ./condition-check.sh
   cacheexec --ttl 5m --verbose -- ./check.sh
   cacheexec --clear --older-than 24h
 

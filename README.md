@@ -20,7 +20,7 @@ Distribution and end-user installation instructions have not been finalized yet.
 
 ```sh
 cacheexec --ttl 5m --include-codes 0 -- curl -fsS https://example.com/status
-cacheexec --ttl 5m --include-codes 0,1 -- sh -c './condition-check.sh'
+cacheexec --ttl 5m --include-codes 0,1 -- ./condition-check.sh
 cacheexec --ttl 5m --key "$DEPLOY_ENV" --refresh -- ./query
 ```
 
@@ -29,7 +29,7 @@ Run the same invocation again while its saved result is eligible to replay the o
 ## Important behavior
 
 - **Nonzero exit codes are cached by default.** Use `--include-codes 0` when transient failures must not be reused.
-- The command **must follow `--`**. It is executed directly without shell interpretation; use `sh -c` explicitly for pipelines, redirects or expansions.
+- The command **must follow `--`** and is executed directly without shell interpretation. To cache a complete shell expression, such as a pipeline, invoke `sh -c` explicitly.
 - Keys include the command, exact argument boundaries, working directory and optional `--key`. Environment variables, executable contents and input file contents are not automatically tracked.
 - The child inherits the environment but receives closed stdin. Interactive commands and PTYs are out of scope.
 - Outputs are buffered in memory. Replay preserves bytes, but not timing or ordering between stdout and stderr.
@@ -37,6 +37,14 @@ Run the same invocation again while its saved result is eligible to replay the o
 ## Command execution and output
 
 The child streams its stdout and stderr while running. A cache hit skips execution and replays each byte stream and the original exit code. Non-UTF-8 bytes are preserved. Stream timing and ordering between stdout and stderr are not preserved on replay. Diagnostics are added only when `--verbose` is specified.
+
+To cache the result of an entire pipeline, pass the expression as the command string for `sh -c`:
+
+```sh
+cacheexec --ttl 5m -- sh -c './query | jq .result'
+```
+
+Shell syntax outside that command string is handled by the shell that invoked cacheexec. For example, `cacheexec --ttl 5m -- ./query > result.json` writes both live and replayed output to the file on every invocation. Putting the redirection inside `sh -c` instead makes the file write part of the skipped command on a cache hit.
 
 Commands are never automatically retried. Start failures and signal termination are never saved.
 
@@ -51,7 +59,7 @@ All normal exit codes (0–255) are saved by default. `--include-codes 0,1` save
 For a condition script, use:
 
 ```sh
-cacheexec --ttl 5m --include-codes 0,1 -- sh -c './condition-check.sh'
+cacheexec --ttl 5m --include-codes 0,1 -- ./condition-check.sh
 ```
 
 Codes 0 and 1 are reusable, while other codes and their stderr are returned each time. cacheexec attaches no application meaning to codes. After clearing the saved result, the next call runs the script again.
