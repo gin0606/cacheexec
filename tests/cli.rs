@@ -650,7 +650,9 @@ fn verbose_failure_interrupt_and_cli_contracts() {
     let help = f.command().arg("--help").output().unwrap();
     let help = String::from_utf8_lossy(&help.stdout);
     assert!(
-        help.contains("--verbose")
+        help.contains("cacheexec --ttl <TTL> [OPTIONS] -- <COMMAND>...")
+            && help.contains("cacheexec --clear [--older-than <DURATION>] [--cache-dir <PATH>]")
+            && help.contains("--verbose")
             && help.contains("stderr")
             && help.contains("best effort")
             && help.contains("not a stable format")

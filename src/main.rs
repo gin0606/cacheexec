@@ -16,22 +16,20 @@ use std::{ffi::OsString, path::PathBuf, time::Duration};
 #[command(
     version,
     about = "Cache non-interactive command output and exit status",
+    override_usage = "cacheexec --ttl <TTL> [OPTIONS] -- <COMMAND>...
+       cacheexec --clear [--older-than <DURATION>] [--cache-dir <PATH>]",
     after_help = "Examples:
   cacheexec --ttl 5m --include-codes 0 -- curl -fsS https://example.com/status
   cacheexec --ttl 5m --include-codes 0,1 -- sh -c './condition-check.sh'
-  cacheexec --ttl 5m --verbose -- sh -c ./check.sh
+  cacheexec --ttl 5m --verbose -- ./check.sh
   cacheexec --clear --older-than 24h
 
-Execution:
+Important behavior:
   Put -- before the command. Arguments run directly; stdin is closed.
   All normal exit codes, including nonzero codes, are cached by default.
   TTL starts at completion (500ms, 5m, 1h). Environment changes are not keyed.
   Same-key calls share execution, including --refresh and different policies.
   --verbose adds human diagnostics to stderr (best effort; not a stable format).
-  Output is binary-safe; replay does not preserve timing between streams.
-  Before publication, owner SIGINT/SIGTERM cancel the shared execution.
-  After publication, signals and delivery errors affect only that caller.
-  Owner death before publication fails waiters without retry. No execution timeout.
 
 Exit codes:
   0..255       Child's normal exit code
@@ -42,10 +40,8 @@ Exit codes:
 
 Storage and cleanup:
   $XDG_CACHE_HOME/cacheexec or $HOME/.cache/cacheexec; override with --cache-dir.
-  --clear takes no command or TTL and skips busy keys. --older-than uses
-  completion age strictly greater than its duration, independently of TTL.
-  Cleanup reports counts; partial failures exit 125. Locks and unidentified
-  temporary files remain. No automatic cleanup.
+  --clear takes no command or TTL, skips busy keys and reports counts.
+  There is no automatic cleanup.
   See README.md / README.ja.md for recovery steps and full behavior."
 )]
 struct Cli {
