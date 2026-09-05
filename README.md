@@ -1,5 +1,7 @@
 # cacheexec
 
+[日本語](README.ja.md)
+
 Cache the stdout, stderr and exit code of a non-interactive command on macOS and Linux.
 
 ```sh
