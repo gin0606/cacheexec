@@ -75,6 +75,13 @@ open descriptors. An abandoned marker is reclaimed by the next same-key call.
 Do not remove or replace lock files while invocations are running. Filesystem or
 lock failures are explicit errors. Use the cleanup options below for deletion.
 
+## Recovering from corrupt results
+
+Corruption errors identify the affected `.result` file and include recovery steps.
+Stop all cacheexec invocations using that cache directory, remove only the named
+`.result` file, then retry the original command. Keep `.lock` and `.active` files.
+Neither `--refresh` nor `--clear` silently discards corrupt results.
+
 ## Explicit cleanup
 
 ```sh

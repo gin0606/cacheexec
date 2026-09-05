@@ -74,9 +74,15 @@ pub fn load(path: &Path) -> Result<Option<Record>> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).context("read cached result"),
+        Err(e) => return Err(e).with_context(|| format!("read cached result {path:?}")),
     };
-    decode(&bytes).context("corrupt cached result").map(Some)
+    decode(&bytes)
+        .with_context(|| {
+            format!(
+                "corrupt cached result {path:?}. Recovery: stop all cacheexec invocations using this cache directory, remove only this .result file, then retry; keep .lock and .active files"
+            )
+        })
+        .map(Some)
 }
 
 pub fn decode(bytes: &[u8]) -> Result<Record> {
@@ -113,7 +119,7 @@ pub fn invalidate(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e).context("invalidate previous cached result"),
+        Err(e) => Err(e).with_context(|| format!("invalidate previous cached result {path:?}")),
     }
 }
 

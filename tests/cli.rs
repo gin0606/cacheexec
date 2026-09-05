@@ -211,9 +211,22 @@ fn corruption_is_an_error_and_never_executes_child() {
         }
         let output = f.run(&opts, SCRIPT);
         assert_eq!(output.status.code(), Some(125));
-        assert!(String::from_utf8_lossy(&output.stderr).contains("corrupt"));
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        assert!(diagnostic.contains("corrupt cached result"));
+        assert!(diagnostic.contains(f.result().to_str().unwrap()));
+        assert!(diagnostic.contains("stop all cacheexec invocations"));
+        assert!(diagnostic.contains("remove only this .result file"));
+        assert!(diagnostic.contains("keep .lock and .active files"));
     }
+    let clear = f.command().arg("--clear").output().unwrap();
+    assert_eq!(clear.status.code(), Some(125));
+    let diagnostic = String::from_utf8_lossy(&clear.stderr);
+    assert!(diagnostic.contains(f.result().to_str().unwrap()));
+    assert!(diagnostic.contains("Recovery:"));
     assert_eq!(f.count(), "x");
+    fs::remove_file(f.result()).unwrap();
+    assert!(f.run(&["--ttl", "1h"], SCRIPT).status.success());
+    assert_eq!(f.count(), "xx");
 }
 #[test]
 fn spawn_failure_and_signals_are_not_cached() {
@@ -232,12 +245,46 @@ fn spawn_failure_and_signals_are_not_cached() {
     };
     assert!(run(false).status.success());
     fs::remove_file(&program).unwrap();
-    assert_eq!(run(true).status.code(), Some(125));
-    assert_eq!(run(false).status.code(), Some(125));
+    for refresh in [true, false] {
+        let output = run(refresh);
+        assert_eq!(output.status.code(), Some(125));
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr)
+                .matches("could not start")
+                .count(),
+            1
+        );
+    }
     let script = "printf x >> count; kill -TERM $$";
     assert_eq!(f.run(&["--ttl", "1h"], script).status.code(), Some(143));
     assert_eq!(f.run(&["--ttl", "1h"], script).status.code(), Some(143));
     assert_eq!(f.count(), "xxx");
+}
+#[test]
+fn output_transfer_failure_is_reported_once() {
+    use std::process::Stdio;
+    let f = Fixture::new();
+    let mut child = f
+        .command()
+        .args([
+            "--ttl",
+            "1h",
+            "--",
+            "sh",
+            "-c",
+            "while ! test -f go; do sleep 0.01; done; printf output",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    fs::write(f.root.path().join("go"), "").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(125));
+    let diagnostic = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(diagnostic.matches("output transfer failed").count(), 1);
+    assert_eq!(diagnostic.matches("child already completed").count(), 1);
 }
 #[test]
 fn storage_access_errors_are_diagnosed() {

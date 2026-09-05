@@ -125,35 +125,38 @@ pub fn run(cli: &Cli, directory: &Path, key: &str, result_path: &Path) -> Result
     unlock(&gate)?;
     let execution = runner::execute(&cli.command);
     lock(&gate, false)?;
-    let child_context = match &execution {
-        Ok(execution) => format!("child already completed with exit code {}", execution.code),
-        Err(error) => format!("execution failed: {error:#}"),
-    };
-    let outcome = execution
-        .and_then(|mut execution| {
-            active.rewind()?;
-            let mut votes = [0; 256];
-            active.read_exact(&mut votes)?;
-            apply_interrupt(&mut execution, result_path)?;
-            if execution.reusable && votes[execution.code as usize] != 0 {
-                cache::save(result_path, &execution.record).context("could not save result")?;
-            }
-            apply_interrupt(&mut execution, result_path)?;
+    let child_context = execution
+        .as_ref()
+        .ok()
+        .map(|execution| format!("child already completed with exit code {}", execution.code));
+    let outcome = execution.and_then(|mut execution| {
+        active.rewind()?;
+        let mut votes = [0; 256];
+        active.read_exact(&mut votes)?;
+        apply_interrupt(&mut execution, result_path)?;
+        if execution.reusable && votes[execution.code as usize] != 0 {
+            cache::save(result_path, &execution.record)
+                .with_context(|| format!("could not save result {result_path:?}"))?;
+        }
+        apply_interrupt(&mut execution, result_path)?;
+        stage(&mut active, &cache::encode(&execution.record)?)?;
+        if apply_interrupt(&mut execution, result_path)? {
             stage(&mut active, &cache::encode(&execution.record)?)?;
-            if apply_interrupt(&mut execution, result_path)? {
-                stage(&mut active, &cache::encode(&execution.record)?)?;
-            }
-            fs::remove_file(&active_path).context("remove completed execution marker")?;
-            if apply_interrupt(&mut execution, result_path)? {
-                stage(&mut active, &cache::encode(&execution.record)?)?;
-            }
-            // Only this final byte publishes success. Shared data is temporary, so the
-            // commit byte needs process visibility, not crash durability.
-            active.seek(SeekFrom::Start(256))?;
-            active.write_all(&[0]).context("commit shared result")?;
-            Ok(execution.code)
-        })
-        .with_context(|| child_context);
+        }
+        fs::remove_file(&active_path).context("remove completed execution marker")?;
+        if apply_interrupt(&mut execution, result_path)? {
+            stage(&mut active, &cache::encode(&execution.record)?)?;
+        }
+        // Only this final byte publishes success. Shared data is temporary, so the
+        // commit byte needs process visibility, not crash durability.
+        active.seek(SeekFrom::Start(256))?;
+        active.write_all(&[0]).context("commit shared result")?;
+        Ok(execution.code)
+    });
+    let outcome = match child_context {
+        Some(context) => outcome.context(context),
+        None => outcome,
+    };
     if let Err(error) = &outcome {
         let invalidation = cache::invalidate(result_path);
         let message = match invalidation {
