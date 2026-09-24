@@ -1,12 +1,12 @@
 mod domain;
 mod shell;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::{
     Parser,
     error::{ContextKind, ContextValue, ErrorKind},
 };
-use domain::{key, policy};
+use domain::{key, location, policy};
 use shell::{cleanup, sharing, signals, verbose};
 use std::{ffi::OsString, path::PathBuf, time::Duration};
 
@@ -103,13 +103,8 @@ fn run(cli: Cli, diagnostic: &verbose::Verbose) -> Result<i32> {
 }
 
 fn default_cache_dir() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("XDG_CACHE_HOME").filter(|s| !s.is_empty()) {
-        return Ok(PathBuf::from(path).join("cacheexec"));
-    }
-    if let Some(path) = std::env::var_os("HOME").filter(|s| !s.is_empty()) {
-        return Ok(PathBuf::from(path).join(".cache/cacheexec"));
-    }
-    bail!("neither XDG_CACHE_HOME nor HOME is set; supply --cache-dir")
+    location::default_cache_dir(std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME"))
+        .context("neither XDG_CACHE_HOME nor HOME is set; supply --cache-dir")
 }
 
 fn parse_cli() -> Cli {

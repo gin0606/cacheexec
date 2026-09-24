@@ -1,5 +1,9 @@
 use crate::{
-    domain::delivery,
+    domain::{
+        cleanup::{Disposal, disposal, summary_line},
+        delivery,
+        location::key_of_entry,
+    },
     shell::{lock, store},
 };
 use anyhow::{Context, Result, bail};
@@ -10,10 +14,6 @@ use std::{
     path::Path,
     time::{Duration, SystemTime},
 };
-
-fn old_enough(completed: SystemTime, age: Option<Duration>, now: SystemTime) -> bool {
-    age.is_none_or(|limit| now.duration_since(completed).is_ok_and(|age| age > limit))
-}
 
 /// Unlinks an idle key's `.lock` while its lock is held. Callers waiting on the
 /// old inode see that it has no links left once they lock it, and reopen the
@@ -26,7 +26,7 @@ pub fn run(directory: &Path, age: Option<Duration>) -> Result<i32> {
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            print_summary("removed=0 abandoned=0 skipped=0 failed=0")?;
+            print_summary(&summary_line(0, 0, 0, 0))?;
             return Ok(0);
         }
         Err(error) => return Err(error).context("scan cache directory"),
@@ -38,15 +38,8 @@ pub fn run(directory: &Path, age: Option<Duration>) -> Result<i32> {
             Ok(entry) => {
                 let name = entry.file_name();
                 let Some(name) = name.to_str() else { continue };
-                if let Some((key, extension)) = name.rsplit_once('.') {
-                    if matches!(extension, "result" | "active" | "lock")
-                        && key.len() == 64
-                        && key
-                            .bytes()
-                            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-                    {
-                        keys.insert(key.to_owned());
-                    }
+                if let Some(key) = key_of_entry(name) {
+                    keys.insert(key.to_owned());
                 }
             }
             Err(error) => errors.push(format!("scan cache entry: {error}")),
@@ -89,24 +82,21 @@ pub fn run(directory: &Path, age: Option<Duration>) -> Result<i32> {
                 ),
                 None => None,
             };
-            let Some(completed) = completed else {
-                return remove_gate(&gate_path);
-            };
-            if old_enough(completed, age, now) {
-                fs::remove_file(&result_path).context("delete cached result")?;
-                removed += 1;
-                return remove_gate(&gate_path);
+            match disposal(completed, age, now) {
+                Disposal::Keep => Ok(()),
+                Disposal::Gate => remove_gate(&gate_path),
+                Disposal::ResultAndGate => {
+                    fs::remove_file(&result_path).context("delete cached result")?;
+                    removed += 1;
+                    remove_gate(&gate_path)
+                }
             }
-            Ok(())
         })();
         if let Err(error) = outcome {
             errors.push(format!("{key}: {error:#}"));
         }
     }
-    let summary = format!(
-        "removed={removed} abandoned={abandoned} skipped={skipped} failed={}",
-        errors.len()
-    );
+    let summary = summary_line(removed, abandoned, skipped, errors.len());
     if !errors.is_empty() {
         bail!(
             "cache cleanup partially applied ({summary}): {}",
@@ -126,23 +116,5 @@ fn print_summary(summary: &str) -> Result<()> {
             Err(error).with_context(|| format!("print cleanup summary ({summary})"))
         }
         _ => Ok(()),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn strict_completion_age_boundary() {
-        let completed = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
-        let age = Duration::from_secs(5);
-        assert!(!old_enough(completed, Some(age), completed + age));
-        assert!(old_enough(
-            completed,
-            Some(age),
-            completed + age + Duration::from_nanos(1)
-        ));
-        assert!(!old_enough(completed, Some(age), SystemTime::UNIX_EPOCH));
-        assert!(old_enough(completed, None, SystemTime::UNIX_EPOCH));
     }
 }

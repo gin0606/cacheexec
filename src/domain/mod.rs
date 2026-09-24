@@ -3,9 +3,12 @@
 //! in what they observed (bytes, statuses, the current time) and carry out the
 //! result. Modules here depend only on each other, never on `crate::shell`.
 
+pub mod cleanup;
 pub mod delivery;
 pub mod execution;
 pub mod key;
+pub mod location;
+pub mod message;
 pub mod policy;
 pub mod record;
 pub mod shared;

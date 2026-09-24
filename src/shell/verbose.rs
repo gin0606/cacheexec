@@ -1,3 +1,4 @@
+use crate::domain::message;
 use std::{
     cell::Cell,
     fs::File,
@@ -89,16 +90,8 @@ impl Verbose {
         if self.sender.is_none() {
             return;
         }
-        let age = match age {
-            Some(Ok(age)) => format!(" age={}s", age.as_secs_f64()),
-            Some(Err(future)) => format!(" age=-{}s", future.duration().as_secs_f64()),
-            None => String::new(),
-        };
         let directory = std::path::absolute(directory).unwrap_or_else(|_| directory.to_path_buf());
-        self.emit(format!(
-            "{action}{age} ttl={} key={key} cache-dir={directory:?}",
-            humantime::format_duration(ttl),
-        ));
+        self.emit(message::decision(action, age, ttl, &directory, key));
     }
 
     pub fn finish(&self, message: String) {
@@ -108,7 +101,7 @@ impl Verbose {
     }
 
     pub fn failed(&self, saved: &str) {
-        self.finish(format!("failed saved={saved} reason=failure"));
+        self.finish(message::failed(saved, "failure"));
     }
 }
 

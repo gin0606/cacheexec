@@ -2,6 +2,7 @@ use crate::{
     domain::{
         delivery,
         execution::{self, CODES, Outcome, Saving, Votes, signal_code},
+        message,
         policy::Request,
         record::Record,
         shared::{self, COMPLETED, DETAIL_OFFSET, FAILED, Published, TAG_OFFSET},
@@ -38,9 +39,7 @@ fn vote(file: &mut File, request: &Request) -> Result<()> {
 
 fn interrupted(diagnostic: &Verbose, reason: &str) -> i32 {
     let code = signal_code(signals::received());
-    diagnostic.finish(format!(
-        "interrupted exit={code} saved=unknown reason={reason}"
-    ));
+    diagnostic.finish(message::interrupted(code, reason));
     code
 }
 
@@ -136,10 +135,10 @@ fn join(mut active: File, diagnostic: &Verbose) -> Result<i32> {
         ),
         Published::Failed {
             invalidated,
-            message,
+            message: failure,
         } => {
-            diagnostic.failed(if invalidated { "no" } else { "unknown" });
-            bail!("shared execution failed: {message}");
+            diagnostic.failed(message::saved_after_failure(invalidated));
+            bail!("shared execution failed: {failure}");
         }
         Published::Unfinished => bail!(
             "execution owner disappeared before publishing a complete result; command not retried"
@@ -198,7 +197,7 @@ fn own(
     if let Err(error) = &outcome {
         let invalidation = store::invalidate(result_path);
         let invalidated = invalidation.is_ok();
-        diagnostic.failed(if invalidated { "no" } else { "unknown" });
+        diagnostic.failed(message::saved_after_failure(invalidated));
         let message = match invalidation {
             Ok(()) => format!("{error:#}"),
             Err(cleanup) => format!("{error:#}; could not invalidate result: {cleanup:#}"),
@@ -243,11 +242,11 @@ fn report(
     let signal = signals::received();
     match delivery::classify(outcome, command_code, signal, generation_interrupted) {
         Ok((code, kind)) => {
-            diagnostic.finish(format!("{kind} exit={code} saved={saving}"));
+            diagnostic.finish(message::finished(kind, code, saving));
             Ok(code)
         }
         Err(error) => {
-            diagnostic.finish(format!("failed saved={saving} reason={failure}"));
+            diagnostic.finish(message::failed(saving, failure));
             Err(error)
         }
     }
