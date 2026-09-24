@@ -4,6 +4,7 @@
 //! result. Modules here depend only on each other, never on `crate::shell`.
 
 pub mod delivery;
+pub mod execution;
 pub mod key;
 pub mod policy;
 pub mod record;

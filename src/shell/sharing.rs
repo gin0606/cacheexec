@@ -1,6 +1,7 @@
 use crate::{
     domain::{
         delivery,
+        execution::{self, CODES, Outcome, Saving, Votes, signal_code},
         policy::Request,
         record::{self, Record},
     },
@@ -27,55 +28,23 @@ const PENDING: u8 = 2;
 const COMPLETED: u8 = 3;
 const FAILED: u8 = 4;
 
-#[derive(Clone, Copy, PartialEq)]
-enum Saving {
-    Saved = 1,
-    Excluded = 2,
-    Interrupted = 3,
-}
-
-impl Saving {
-    fn of(execution: &runner::Execution, votes: &[u8; 256]) -> Self {
-        if !execution.reusable {
-            Self::Interrupted
-        } else if votes[execution.code as usize] != 0 {
-            Self::Saved
-        } else {
-            Self::Excluded
-        }
-    }
-    fn decode(byte: u8) -> Result<Self> {
-        Ok(match byte {
-            1 => Self::Saved,
-            2 => Self::Excluded,
-            3 => Self::Interrupted,
-            _ => bail!("invalid shared saving status"),
-        })
-    }
-    fn describe(self) -> &'static str {
-        match self {
-            Self::Saved => "yes",
-            Self::Excluded => "no reason=participant-policy",
-            Self::Interrupted => "no reason=interrupted",
-        }
-    }
+fn read_votes(file: &mut File) -> std::io::Result<Votes> {
+    let mut votes = [0; CODES];
+    file.read_exact(&mut votes)?;
+    Ok(votes)
 }
 
 fn vote(file: &mut File, request: &Request) -> Result<()> {
     file.rewind()?;
-    let mut votes = [0; 256];
-    file.read_exact(&mut votes)
-        .context("read active execution policies")?;
-    for (code, vote) in votes.iter_mut().enumerate() {
-        *vote |= u8::from(request.allows(code as i32));
-    }
+    let mut votes = read_votes(file).context("read active execution policies")?;
+    execution::add_vote(&mut votes, request);
     file.rewind()?;
     file.write_all(&votes)?;
     Ok(())
 }
 
 fn interrupted(diagnostic: &Verbose, reason: &str) -> i32 {
-    let code = 128 + signals::received();
+    let code = signal_code(signals::received());
     diagnostic.finish(format!(
         "interrupted exit={code} saved=unknown reason={reason}"
     ));
@@ -205,28 +174,30 @@ fn own(
 ) -> Result<i32> {
     let execution = runner::execute(&request.command);
     lock(gate, false)?;
-    let child_context = execution
-        .as_ref()
-        .ok()
-        .map(|execution| format!("child already completed with exit code {}", execution.code));
+    let child_context = execution.as_ref().ok().map(|execution| {
+        format!(
+            "child already completed with exit code {}",
+            execution.outcome.code()
+        )
+    });
     let outcome = execution.and_then(|mut execution| {
         active.rewind()?;
-        let mut votes = [0; 256];
-        active.read_exact(&mut votes)?;
-        apply_interrupt(&mut execution, result_path)?;
-        if execution.reusable && votes[execution.code as usize] != 0 {
-            store::save(result_path, &execution.record)
+        let votes = read_votes(&mut active)?;
+        let child = &mut execution.outcome;
+        apply_interrupt(child, result_path)?;
+        if child.savable(&votes) {
+            store::save(result_path, child.record())
                 .with_context(|| format!("could not save result {result_path:?}"))?;
         }
-        apply_interrupt(&mut execution, result_path)?;
-        stage(&mut active, &execution, &votes)?;
-        if apply_interrupt(&mut execution, result_path)? {
-            stage(&mut active, &execution, &votes)?;
+        apply_interrupt(child, result_path)?;
+        stage(&mut active, child, &votes)?;
+        if apply_interrupt(child, result_path)? {
+            stage(&mut active, child, &votes)?;
         }
         fs::remove_file(active_path).context("remove completed execution marker")?;
         let signal = signals::seal_execution();
-        if apply_signal(&mut execution, result_path, signal)? {
-            stage(&mut active, &execution, &votes)?;
+        if apply_signal(child, result_path, signal)? {
+            stage(&mut active, child, &votes)?;
         }
         // Only this final byte publishes success. Shared data is temporary, so the
         // commit byte needs process visibility, not crash durability.
@@ -234,8 +205,8 @@ fn own(
         active
             .write_all(&[COMPLETED])
             .context("commit shared result")?;
-        let saving = Saving::of(&execution, &votes);
-        Ok((execution.code, saving, execution.delivery))
+        let saving = Saving::of(child, &votes);
+        Ok((child.code(), saving, execution.delivery))
     });
     let outcome = match child_context {
         Some(context) => outcome.context(context),
@@ -287,7 +258,7 @@ fn report(
 ) -> Result<i32> {
     // Sampled once so the exit status and its label cannot disagree.
     let signal = signals::received();
-    match classify(outcome, command_code, signal, generation_interrupted) {
+    match delivery::classify(outcome, command_code, signal, generation_interrupted) {
         Ok((code, kind)) => {
             diagnostic.finish(format!("{kind} exit={code} saved={saving}"));
             Ok(code)
@@ -297,34 +268,6 @@ fn report(
             Err(error)
         }
     }
-}
-
-/// The exit status and completion label of a delivery or replay outcome.
-fn classify(
-    outcome: Result<i32>,
-    command_code: i32,
-    signal: i32,
-    generation_interrupted: bool,
-) -> Result<(i32, &'static str)> {
-    let (code, kind) = match outcome {
-        // A signal received during delivery ends it with 128 + signal however
-        // delivery ended, as Delivery::finish and Record::replay do.
-        _ if signal != 0 => (128 + signal, "interrupted"),
-        Ok(code) => (code, "completed"),
-        // A consumer such as `head` closing its end is a normal way to stop
-        // reading, not a tool failure. The status of the delivered result is
-        // still known, so it is reported; shared and saved results stay intact.
-        Err(error) if delivery::output_closed(&error) => (command_code, "output-closed"),
-        Err(error) => return Err(error),
-    };
-    Ok((
-        code,
-        if generation_interrupted {
-            "interrupted"
-        } else {
-            kind
-        },
-    ))
 }
 
 /// Publishes a failed execution to waiters. An error is useful even if storage
@@ -342,27 +285,24 @@ fn publish_failure(active: &mut File, invalidated: bool, message: &str) -> Resul
     .with_context(|| message.to_owned())
 }
 
-fn stage(active: &mut File, execution: &runner::Execution, votes: &[u8; 256]) -> Result<()> {
+fn stage(active: &mut File, outcome: &Outcome, votes: &Votes) -> Result<()> {
     active.seek(SeekFrom::Start(DETAIL_OFFSET))?;
     active.set_len(DETAIL_OFFSET)?;
-    active.write_all(&[Saving::of(execution, votes) as u8])?;
+    active.write_all(&[Saving::of(outcome, votes) as u8])?;
     active
-        .write_all(&record::encode(&execution.record)?)
+        .write_all(&record::encode(outcome.record())?)
         .context("write shared result")
 }
 
-fn apply_interrupt(execution: &mut runner::Execution, path: &Path) -> Result<bool> {
-    apply_signal(execution, path, signals::received())
+fn apply_interrupt(outcome: &mut Outcome, path: &Path) -> Result<bool> {
+    apply_signal(outcome, path, signals::received())
 }
 
-fn apply_signal(execution: &mut runner::Execution, path: &Path, signal: i32) -> Result<bool> {
+fn apply_signal(outcome: &mut Outcome, path: &Path, signal: i32) -> Result<bool> {
     if signal == 0 {
         return Ok(false);
     }
-    let changed = execution.code != 128 + signal || execution.reusable;
-    execution.code = 128 + signal;
-    execution.record.code = execution.code;
-    execution.reusable = false;
+    let changed = outcome.interrupt(signal);
     store::invalidate(path)?;
     Ok(changed)
 }
@@ -370,41 +310,6 @@ fn apply_signal(execution: &mut runner::Execution, path: &Path, signal: i32) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn closed() -> anyhow::Error {
-        anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
-            .context("replay stdout")
-    }
-
-    #[test]
-    fn a_signal_during_delivery_wins_over_every_outcome() {
-        for outcome in [Ok(3), Err(closed()), Err(anyhow::anyhow!("disk full"))] {
-            let classified = classify(outcome, 3, libc::SIGTERM, false).unwrap();
-            assert_eq!(classified, (143, "interrupted"));
-        }
-    }
-
-    #[test]
-    fn a_closed_reader_keeps_the_command_status_and_other_failures_are_errors() {
-        assert_eq!(classify(Ok(7), 7, 0, false).unwrap(), (7, "completed"));
-        assert_eq!(
-            classify(Err(closed()), 7, 0, false).unwrap(),
-            (7, "output-closed")
-        );
-        assert!(classify(Err(anyhow::anyhow!("EIO")), 7, 0, false).is_err());
-    }
-
-    #[test]
-    fn an_interrupted_generation_is_labelled_interrupted() {
-        assert_eq!(
-            classify(Ok(143), 143, 0, true).unwrap(),
-            (143, "interrupted")
-        );
-        assert_eq!(
-            classify(Err(closed()), 143, 0, true).unwrap(),
-            (143, "interrupted")
-        );
-    }
 
     fn create(path: &Path) -> File {
         OpenOptions::new()

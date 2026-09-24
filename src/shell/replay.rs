@@ -1,5 +1,5 @@
 use crate::{
-    domain::{delivery::delivery_result, record::Record},
+    domain::{delivery::delivery_result, execution::signal_code, record::Record},
     shell::signals,
 };
 use anyhow::{Context, Result, bail};
@@ -19,14 +19,14 @@ pub fn write(record: Record) -> Result<i32> {
         if signals::received() != 0 {
             // main exits immediately after this return; a blocked writer must not
             // prevent cancellation or keep the process alive.
-            return Ok(128 + signals::received());
+            return Ok(signal_code(signals::received()));
         }
         // Completion wakes immediately; the timeout only bounds signal latency
         // while an output consumer has stopped reading.
         match completion.recv_timeout(Duration::from_millis(10)) {
             Ok(result) => {
                 if signals::received() != 0 {
-                    return Ok(128 + signals::received());
+                    return Ok(signal_code(signals::received()));
                 }
                 result?;
                 return Ok(code);

@@ -1,5 +1,8 @@
 use crate::{
-    domain::{delivery::delivery_result, record::Record},
+    domain::{
+        delivery::delivery_result,
+        execution::{Outcome, signal_code},
+    },
     shell::signals,
 };
 use anyhow::{Context, Result, anyhow};
@@ -14,9 +17,7 @@ use std::{
 };
 
 pub struct Execution {
-    pub code: i32,
-    pub record: Record,
-    pub reusable: bool,
+    pub outcome: Outcome,
     pub delivery: Delivery,
 }
 
@@ -87,13 +88,6 @@ pub fn execute(argv: &[OsString]) -> Result<Execution> {
     });
     let status = status.context("wait for child")?;
     let interrupted = signals::received();
-    let code = if interrupted != 0 {
-        128 + interrupted
-    } else {
-        status
-            .code()
-            .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
-    };
     let context = || {
         format!(
             "child already completed with {}; output transfer failed",
@@ -108,17 +102,16 @@ pub fn execute(argv: &[OsString]) -> Result<Execution> {
         .map_err(|_| anyhow!("stderr worker panicked"))
         .and_then(|v| v)
         .with_context(context)?;
-    let reusable = status.code().is_some() && interrupted == 0;
-    let record = Record {
-        completed: completed.context("missing child completion time")?,
-        code,
+    let outcome = Outcome::new(
+        completed.context("missing child completion time")?,
+        status.code(),
+        status.signal(),
+        interrupted,
         stdout,
         stderr,
-    };
+    );
     Ok(Execution {
-        code,
-        record,
-        reusable,
+        outcome,
         delivery: Delivery([out_writer, err_writer]),
     })
 }
@@ -132,7 +125,7 @@ impl Delivery {
         }
         let signal = signals::received();
         if signal != 0 {
-            return Ok(128 + signal);
+            return Ok(signal_code(signal));
         }
         let [out, err] = self.0.map(|writer| {
             writer
