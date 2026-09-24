@@ -604,15 +604,21 @@ fn cleanup_preserves_running_refresh_and_undelivered_waiter_generation() {
     let s = Sandbox::new();
     s.gate("go").release();
     assert_eq!(code(&s.run(&["--ttl", "1h"], &SCRIPT)), Some(7));
+    {
+        // A caller deciding whether to reuse the result holds the lock.
+        let _held = Held::lock(&s);
+        assert!(clear(&s).contains("skipped=1"), "cleanup took a held key");
+        assert_eq!(
+            s.cache_files("result").len(),
+            1,
+            "cleanup deleted a held result"
+        );
+    }
     let mut go = s.gate("go");
     let leader = owner(&s, &["--refresh", "--include-codes", "7"], &SCRIPT);
     let joined = verbose_waiter(&s, "waiter", &["--include-codes", "1"], &SCRIPT);
     // Keep the waiter from reading its generation.
     joined.signal(libc::SIGSTOP);
-    {
-        let _held = Held::lock(&s);
-        assert!(clear(&s).contains("skipped=1"), "cleanup took a held key");
-    }
     assert!(
         clear(&s).contains("skipped=1"),
         "cleanup took a running execution"

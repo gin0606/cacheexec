@@ -62,7 +62,9 @@ fn missing_separator_suggests_command_syntax_without_masking_option_errors() {
 
 #[test]
 fn hit_replays_binary_streams_and_every_exit_code() {
-    for exit in ["exit:0", "exit:1", "exit:23", "exit:125", "exit:255"] {
+    for exit in [
+        "exit:0", "exit:1", "exit:2", "exit:23", "exit:125", "exit:255",
+    ] {
         let s = Sandbox::new();
         let steps = with(&BYTES, &[exit]);
         let first = s.run(&["--ttl", "1h"], &steps);
@@ -191,6 +193,11 @@ fn refresh_and_policy_invalidate_old_results() {
         "0",
     );
     assert_eq!(code(&conflicting), Some(2));
+    for invalid in ["256", "-1", "x"] {
+        let option = format!("--include-codes={invalid}");
+        let output = run(&["--ttl", "1h", &option], "0");
+        assert_eq!(code(&output), Some(2), "--include-codes {invalid}");
+    }
     assert_eq!(s.count(), "xxxxx");
 }
 
@@ -429,6 +436,19 @@ fn default_cache_directory_follows_xdg_then_home() {
     assert!(!home.exists());
     assert_eq!(code(&run(None, Some(&home))), Some(0));
     assert!(home.join(".cache/cacheexec").is_dir(), "HOME was not used");
+    fs::remove_dir_all(&home).unwrap();
+    assert_eq!(code(&run(Some(""), Some(&home))), Some(0));
+    assert!(
+        home.join(".cache/cacheexec").is_dir(),
+        "an empty XDG_CACHE_HOME was used"
+    );
+    let output = run(None, None);
+    assert_eq!(code(&output), Some(125));
+    assert!(
+        stderr(&output).contains("supply --cache-dir"),
+        "{}",
+        stderr(&output)
+    );
 }
 
 #[test]
