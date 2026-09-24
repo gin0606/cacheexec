@@ -8,7 +8,15 @@ use clap::{
 };
 use domain::{key, location, policy};
 use shell::{cleanup, sharing, signals, verbose};
-use std::{convert::Infallible, ffi::OsString, path::PathBuf, sync::mpsc, time::Duration};
+use std::{
+    convert::Infallible,
+    ffi::OsString,
+    fmt::Display,
+    io::{self, Write},
+    path::PathBuf,
+    sync::{Arc, mpsc},
+    time::Duration,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -128,6 +136,41 @@ fn parse_cli() -> Cli {
 /// only delays exit when stderr is not being read.
 const ERROR_GRACE: Duration = Duration::from_millis(200);
 
+/// Writes the tool error diagnostic from a thread that `spawn` starts, and
+/// waits for it; a signal waits only [`ERROR_GRACE`]. Thread creation fails
+/// under the same resource exhaustion that often caused the error, so when no
+/// thread starts the diagnostic is written inline instead of lost; a signal
+/// cannot cut that write short, which this double failure accepts.
+fn print_error(
+    error: impl Display + Send + Sync + 'static,
+    spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> io::Result<()>,
+    write: impl Fn(&str) + Clone + Send + 'static,
+) {
+    let error = Arc::new(error);
+    let (printed, printing) = mpsc::channel::<Infallible>();
+    let printer = Box::new({
+        let (error, write) = (Arc::clone(&error), write.clone());
+        move || {
+            let _printed = printed;
+            write(&format!("cacheexec: {error:#}"));
+        }
+    });
+    if spawn(printer).is_err() {
+        write(&format!("cacheexec: {error:#}"));
+        return;
+    }
+    let _ = signals::wait_with_grace(&printing, ERROR_GRACE);
+}
+
+fn spawn_printer(printer: Box<dyn FnOnce() + Send>) -> io::Result<()> {
+    std::thread::Builder::new().spawn(printer).map(drop)
+}
+
+fn write_stderr(line: &str) {
+    // A closed stderr must not turn the error into a panic.
+    let _ = writeln!(io::stderr(), "{line}");
+}
+
 fn main() {
     let outcome = {
         let cli = parse_cli();
@@ -144,14 +187,47 @@ fn main() {
             // A signal must not wait long for a stderr consumer that stopped
             // reading, but the error still decides the exit code, so its
             // diagnostic gets a short grace.
-            let (printed, printing) = mpsc::channel::<Infallible>();
-            std::thread::spawn(move || {
-                let _printed = printed;
-                eprintln!("cacheexec: {error:#}");
-            });
-            let _ = signals::wait_with_grace(&printing, ERROR_GRACE);
+            print_error(error, spawn_printer, write_stderr);
             125
         }
     };
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{sync::Mutex, thread};
+
+    fn recorder() -> (
+        Arc<Mutex<Vec<String>>>,
+        impl Fn(&str) + Clone + Send + 'static,
+    ) {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&written);
+        (written, move |line: &str| {
+            sink.lock().unwrap().push(line.to_owned())
+        })
+    }
+
+    #[test]
+    fn the_diagnostic_is_written_inline_when_no_thread_starts() {
+        let (written, write) = recorder();
+        print_error("boom", |_| Err(io::Error::other("no threads")), write);
+        assert_eq!(*written.lock().unwrap(), ["cacheexec: boom"]);
+    }
+
+    #[test]
+    fn the_diagnostic_thread_is_waited_for() {
+        let (written, write) = recorder();
+        let on_main = thread::current().id();
+        let write = move |line: &str| {
+            assert_ne!(thread::current().id(), on_main);
+            // Only a wait makes the line visible once print_error returns.
+            thread::sleep(Duration::from_millis(20));
+            write(line);
+        };
+        print_error("boom", spawn_printer, write);
+        assert_eq!(*written.lock().unwrap(), ["cacheexec: boom"]);
+    }
 }
