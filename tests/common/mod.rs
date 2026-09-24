@@ -114,7 +114,19 @@ impl Sandbox {
 
     /// `cacheexec` run in the sandbox with piped output, without `--cache-dir`.
     pub fn bare_command(&self) -> Command {
+        use std::os::unix::process::CommandExt;
         let mut command = Command::new(CACHEEXEC);
+        // cacheexec keeps signals ignored at startup ignored, so do not pass
+        // on a test runner's own ignored signals; tests that want some ignored
+        // add their own `pre_exec`, which runs after this one.
+        unsafe {
+            command.pre_exec(|| {
+                for signal in [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT, libc::SIGTERM] {
+                    libc::signal(signal, libc::SIG_DFL);
+                }
+                Ok(())
+            });
+        }
         command
             .current_dir(self.root())
             .env("CACHEEXEC_TEST_EVENTS", self.events.path())

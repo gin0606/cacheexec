@@ -84,8 +84,11 @@ fn run(cli: Cli, diagnostic: &verbose::Verbose) -> Result<i32> {
         None => default_cache_dir()?,
     };
     if cli.clear {
+        // Cleanup has no child to forward signals to and nothing to publish, so
+        // it installs no handlers and a signal ends it at once.
         return cleanup::run(&directory, cli.older_than);
     }
+    signals::install()?;
     let request = request::Request {
         command: cli.command,
         ttl: cli.ttl.expect("clap requires --ttl without --clear"),
@@ -127,7 +130,7 @@ fn parse_cli() -> Cli {
 }
 
 fn main() {
-    let code = match signals::install().and_then(|()| {
+    let outcome = {
         let cli = parse_cli();
         let diagnostic = verbose::Verbose::new(cli.verbose);
         let outcome = run(cli, &diagnostic);
@@ -135,7 +138,8 @@ fn main() {
             diagnostic.failed("unknown");
         }
         outcome
-    }) {
+    };
+    let code = match outcome {
         Ok(code) => code,
         Err(error) => {
             let diagnostic = std::thread::spawn(move || eprintln!("cacheexec: {error:#}"));

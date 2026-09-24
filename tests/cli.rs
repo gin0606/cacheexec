@@ -511,6 +511,23 @@ fn clear_all_age_directory_isolation_and_condition_fixture() {
 }
 
 #[test]
+fn clear_blocked_on_its_summary_stays_killable() {
+    use std::os::unix::process::ExitStatusExt;
+    let s = Sandbox::new();
+    s.run(&["--ttl", "1h"], &["exit:0"]);
+    let result = s.cache_file("result");
+    let full = common::FullPipe::new();
+    let mut command = s.command();
+    command.arg("--clear").stdout(full.blocking());
+    let clear = s.spawn("clear", command);
+    // Deletions come before the summary, so once the result is gone cleanup
+    // blocks, or is about to block, on the full stdout.
+    s.wait_until("--clear deleting the result", || !result.exists());
+    clear.signal(libc::SIGTERM);
+    assert_eq!(clear.finish().status.signal(), Some(libc::SIGTERM));
+}
+
+#[test]
 fn clear_reports_partial_failure_and_preserves_corruption() {
     let s = Sandbox::new();
     s.run(&["--ttl", "1h"], &["exit:0"]);
