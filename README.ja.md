@@ -23,10 +23,10 @@ nix profile install github:gin0606/cacheexec
 または、タグの付いたソースをCargoでビルドします。
 
 ```sh
-cargo install --git https://github.com/gin0606/cacheexec --locked
+cargo install --git https://github.com/gin0606/cacheexec --locked --bin cacheexec
 ```
 
-開発時は、ローカルのソースツリーから`cargo install --path . --locked`でインストールできます。
+開発時は、ローカルのソースツリーから`cargo install --path . --locked --bin cacheexec`でインストールできます。
 
 ## クイックスタート
 

@@ -35,6 +35,11 @@
           };
 
           cargoLock.lockFile = ./Cargo.lock;
+          # Leave out the test-only child command.
+          cargoBuildFlags = [
+            "--bin"
+            "cacheexec"
+          ];
 
           meta = {
             inherit (manifest.package) description;

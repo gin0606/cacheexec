@@ -1,594 +1,684 @@
+mod common;
+
+use common::{CHILD, Sandbox, code, text, verbose_lines};
 use std::{
     fs,
-    process::{Command, Output},
-    thread,
-    time::Duration,
+    io::Write,
+    process::Output,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tempfile::TempDir;
 
-struct Fixture {
-    root: TempDir,
+/// Counts the execution and writes non-UTF-8 bytes to both streams.
+const BYTES: [&str; 3] = ["count", "outx:ff006f7574", "errx:fe657272"];
+
+fn with(steps: &[&'static str], more: &[&'static str]) -> Vec<&'static str> {
+    steps.iter().chain(more).copied().collect()
 }
-impl Fixture {
-    fn new() -> Self {
-        Self {
-            root: tempfile::tempdir().unwrap(),
-        }
-    }
-    fn command(&self) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_cacheexec"));
-        cmd.current_dir(self.root.path())
-            .arg("--cache-dir")
-            .arg(self.root.path().join("cache"));
-        cmd
-    }
-    fn run(&self, options: &[&str], script: &str) -> Output {
-        self.command()
-            .args(options)
-            .args(["--", "sh", "-c", script])
-            .output()
-            .unwrap()
-    }
-    fn count(&self) -> String {
-        fs::read_to_string(self.root.path().join("count")).unwrap()
-    }
-    fn result(&self) -> std::path::PathBuf {
-        fs::read_dir(self.root.path().join("cache"))
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .find(|p| p.extension().is_some_and(|s| s == "result"))
-            .unwrap()
-    }
+
+fn stderr(output: &Output) -> String {
+    text(&output.stderr)
 }
-const SCRIPT: &str =
-    "printf x >> count; printf '\\377\\000out'; printf '\\376err' >&2; exit ${CODE:-0}";
+
+fn stdout(output: &Output) -> String {
+    text(&output.stdout)
+}
+
+/// The completion time stored in a result (nanoseconds since the epoch).
+fn stored_completion(result: &[u8]) -> u128 {
+    u128::from_le_bytes(result[8..24].try_into().unwrap())
+}
+
+/// Rewrites the completion time stored in a result, keeping its checksum valid.
+fn set_completion(result: &std::path::Path, completed: SystemTime) {
+    use sha2::{Digest, Sha256};
+    let mut bytes = fs::read(result).unwrap();
+    let nanos = completed.duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    bytes[8..24].copy_from_slice(&nanos.to_le_bytes());
+    let end = bytes.len() - 32;
+    let checksum = Sha256::digest(&bytes[..end]);
+    bytes[end..].copy_from_slice(&checksum);
+    fs::write(result, &bytes).unwrap();
+}
 
 #[test]
 fn missing_separator_suggests_command_syntax_without_masking_option_errors() {
-    let f = Fixture::new();
-    let output = f
-        .command()
-        .args(["--ttl", "5m", "echo", "hello"])
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("put -- before the command"));
-    let output = f
-        .command()
-        .args(["--ttl", "5m", "--refersh"])
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    let diagnostic = String::from_utf8_lossy(&output.stderr);
-    assert!(diagnostic.contains("--refersh"));
-    assert!(!diagnostic.contains("put -- before the command"));
+    let s = Sandbox::new();
+    let mut command = s.command();
+    command.args(["--ttl", "5m", "echo", "hello"]);
+    let output = s.spawn("missing separator", command).finish();
+    assert_eq!(code(&output), Some(2));
+    assert!(
+        stderr(&output).contains("put -- before the command"),
+        "{}",
+        stderr(&output)
+    );
+    let mut command = s.command();
+    command.args(["--ttl", "5m", "--refersh"]);
+    let output = s.spawn("misspelled option", command).finish();
+    assert_eq!(code(&output), Some(2));
+    assert!(stderr(&output).contains("--refersh"), "{}", stderr(&output));
+    assert!(!stderr(&output).contains("put -- before the command"));
 }
 
 #[test]
-fn hit_replays_binary_streams_and_all_exit_codes() {
-    for code in [0, 1, 23, 125, 255] {
-        let f = Fixture::new();
-        let run = || {
-            f.command()
-                .env("CODE", code.to_string())
-                .args(["--ttl", "1h", "--", "sh", "-c", SCRIPT])
-                .output()
-                .unwrap()
-        };
-        let first = run();
-        let hit = run();
-        assert_eq!(first.status.code(), Some(code));
-        assert_eq!(hit.status.code(), Some(code));
-        assert_eq!(first.stdout, b"\xff\0out");
-        assert_eq!(first.stderr, b"\xfeerr");
-        assert_eq!(first.stdout, hit.stdout);
-        assert_eq!(first.stderr, hit.stderr);
-        assert_eq!(f.count(), "x");
+fn hit_replays_binary_streams_and_every_exit_code() {
+    for exit in ["exit:0", "exit:1", "exit:23", "exit:125", "exit:255"] {
+        let s = Sandbox::new();
+        let steps = with(&BYTES, &[exit]);
+        let first = s.run(&["--ttl", "1h"], &steps);
+        let hit = s.run(&["--ttl", "1h"], &steps);
+        let expected = exit.strip_prefix("exit:").unwrap().parse().ok();
+        for (name, output) in [("first run", &first), ("hit", &hit)] {
+            assert_eq!(code(output), expected, "{name} of {exit}");
+            assert_eq!(output.stdout, b"\xff\0out", "{name} of {exit}");
+            assert_eq!(output.stderr, b"\xfeerr", "{name} of {exit}");
+        }
+        assert_eq!(s.count(), "x", "{exit} ran again");
     }
 }
+
 #[test]
-fn ttl_is_a_per_call_completion_age() {
-    let f = Fixture::new();
-    let script = "printf x >> count; sleep 0.15";
-    assert!(f.run(&["--ttl", "100ms"], script).status.success());
-    assert!(f.run(&["--ttl", "100ms"], script).status.success());
-    assert_eq!(f.count(), "x");
-    thread::sleep(Duration::from_millis(130));
-    assert!(f.run(&["--ttl", "1h"], script).status.success());
-    assert_eq!(f.count(), "x");
-    assert!(f.run(&["--ttl", "100ms"], script).status.success());
-    assert_eq!(f.count(), "xx");
+fn ttl_is_chosen_per_call_for_the_same_result() {
+    let s = Sandbox::new();
+    assert_eq!(code(&s.run(&["--ttl", "1h"], &["count"])), Some(0));
+    assert_eq!(code(&s.run(&["--ttl", "1h"], &["count"])), Some(0));
+    assert_eq!(s.count(), "x", "a fresh result was not reused");
+    // The same key: a result of any age is too old for a zero TTL.
+    assert_eq!(code(&s.run(&["--ttl", "0s"], &["count"])), Some(0));
+    assert_eq!(s.count(), "xx", "a zero TTL reused the result");
+    assert_eq!(code(&s.run(&["--ttl", "1h"], &["count"])), Some(0));
+    assert_eq!(s.count(), "xx", "the refreshed result was not reused");
 }
+
+#[test]
+fn a_result_expires_once_its_age_exceeds_the_ttl() {
+    let s = Sandbox::new();
+    s.run(&["--ttl", "1h"], &["count"]);
+    let result = s.cache_file("result");
+    let ago = |age: Duration| SystemTime::now() - age;
+    let cases = [
+        (Duration::from_secs(30 * 60), "1h", true),
+        (Duration::from_secs(2 * 3600), "1h", false),
+        (Duration::from_secs(10), "20s", true),
+        (Duration::from_secs(10), "500ms", false),
+    ];
+    let mut runs = 1;
+    for (age, ttl, reused) in cases {
+        set_completion(&s.cache_file("result"), ago(age));
+        assert_eq!(code(&s.run(&["--ttl", ttl], &["count"])), Some(0));
+        if !reused {
+            runs += 1;
+        }
+        assert_eq!(
+            s.count(),
+            "x".repeat(runs),
+            "a result {age:?} old with --ttl {ttl}"
+        );
+    }
+    assert!(result.exists());
+}
+
+#[test]
+fn completion_time_is_when_the_child_exits() {
+    let s = Sandbox::new();
+    let mut go = s.gate("go");
+    let mut hold = s.gate("hold");
+    // After it is released, the child exits while a descendant keeps its
+    // output open until `hold` is released.
+    let steps = [
+        "count",
+        "event:started",
+        "wait:go",
+        "detach:wait-stdin,event:orphaned,wait:hold",
+        "exit:0",
+    ];
+    let run = s.spawn("run", s.cacheexec(&["--ttl", "1h"], &steps));
+    s.wait_event("started");
+    let released = SystemTime::now();
+    go.release();
+    // The descendant reports once its parent, the child, has exited.
+    s.wait_event("orphaned");
+    // cacheexec notices the exit by polling every 10 ms, so keep the output
+    // open far beyond that, even on a loaded host, before closing it.
+    std::thread::sleep(Duration::from_secs(1));
+    let closing = SystemTime::now();
+    hold.release();
+    assert_eq!(code(&run.finish()), Some(0));
+    let completed = stored_completion(&fs::read(s.cache_file("result")).unwrap());
+    let nanos = |time: SystemTime| time.duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    assert!(
+        nanos(released) < completed && completed < nanos(closing),
+        "completion {completed} is not after the child was released ({}) and before \
+         its output closed ({})",
+        nanos(released),
+        nanos(closing)
+    );
+}
+
 #[test]
 fn refresh_and_policy_invalidate_old_results() {
-    let f = Fixture::new();
-    let script = "printf x >> count; exit ${CODE:-0}";
-    assert!(f.run(&["--ttl", "1h"], script).status.success());
-    let output = f
-        .command()
-        .env("CODE", "7")
-        .args([
-            "--ttl",
-            "1h",
-            "--refresh",
-            "--include-codes",
-            "0,1",
-            "--",
-            "sh",
-            "-c",
-            script,
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(7));
-    assert!(f.run(&["--ttl", "1h"], script).status.success());
-    assert_eq!(f.count(), "xxx");
+    let s = Sandbox::new();
+    let steps = ["count", "exitenv:CODE"];
+    let run = |options: &[&str], exit: &str| {
+        let mut command = s.cacheexec(options, &steps);
+        command.env("CODE", exit);
+        s.spawn("run", command).finish()
+    };
+    assert_eq!(code(&run(&["--ttl", "1h"], "0")), Some(0));
+    let refreshed = run(&["--ttl", "1h", "--refresh", "--include-codes", "0,1"], "7");
+    assert_eq!(code(&refreshed), Some(7));
+    // The refresh invalidated 0 and did not save 7, so this runs again.
+    assert_eq!(code(&run(&["--ttl", "1h"], "0")), Some(0));
+    assert_eq!(s.count(), "xxx");
+    // The saved 0 is excluded by this call's policy, so it runs again.
     assert_eq!(
-        f.run(&["--ttl", "1h", "--exclude-codes", "0"], script)
-            .status
-            .code(),
+        code(&run(&["--ttl", "1h", "--exclude-codes", "0"], "0")),
         Some(0)
     );
-    assert!(f.run(&["--ttl", "1h"], script).status.success());
-    assert_eq!(f.count(), "xxxxx");
-    assert_eq!(
-        f.run(
-            &[
-                "--ttl",
-                "1h",
-                "--include-codes",
-                "0",
-                "--exclude-codes",
-                "1"
-            ],
-            script
-        )
-        .status
-        .code(),
-        Some(2)
+    assert_eq!(s.count(), "xxxx");
+    // That run's 0 was not saved either, since its policy excluded it.
+    assert_eq!(code(&run(&["--ttl", "1h"], "0")), Some(0));
+    assert_eq!(s.count(), "xxxxx");
+    let conflicting = run(
+        &[
+            "--ttl",
+            "1h",
+            "--include-codes",
+            "0",
+            "--exclude-codes",
+            "1",
+        ],
+        "0",
     );
+    assert_eq!(code(&conflicting), Some(2));
+    assert_eq!(s.count(), "xxxxx");
 }
+
 #[test]
 fn keys_preserve_argv_cwd_and_extra_key_not_environment() {
-    let f = Fixture::new();
-    let script = "printf x >> count; printf '%s|' \"$@\"";
-    let run = |args: &[&str], key: &str| {
-        f.command()
-            .args(["--ttl", "1h", "--key", key, "--", "sh", "-c", script, "sh"])
-            .args(args)
-            .output()
-            .unwrap()
+    let s = Sandbox::new();
+    let run = |key: &str, args: &[&str]| {
+        let mut command = s.command();
+        command
+            .args(["--ttl", "1h", "--key", key, "--", CHILD, "count", "args"])
+            .args(args);
+        s.spawn("run", command).finish()
     };
-    assert_eq!(run(&["a b", "c"], "one").stdout, b"a b|c|");
-    assert_eq!(run(&["a", "b c"], "one").stdout, b"a|b c|");
-    run(&["a", "b c"], "two");
-    run(&["a", "b c"], "two");
-    assert_eq!(f.count(), "xxx");
-    let sub = f.root.path().join("sub");
-    fs::create_dir(&sub).unwrap();
-    assert!(
-        f.command()
-            .current_dir(&sub)
-            .args([
-                "--ttl", "1h", "--key", "two", "--", "sh", "-c", script, "sh", "a", "b c"
-            ])
-            .output()
-            .unwrap()
-            .status
-            .success()
+    assert_eq!(run("one", &["a b", "c"]).stdout, b"a b|c|");
+    assert_eq!(
+        run("one", &["a", "b c"]).stdout,
+        b"a|b c|",
+        "argument boundaries"
     );
-    assert_eq!(fs::read_to_string(sub.join("count")).unwrap(), "x");
-    let env_script = "printf %s \"$VALUE\"";
-    let envrun = |value| {
-        f.command()
-            .env("VALUE", value)
-            .args(["--ttl", "1h", "--", "sh", "-c", env_script])
-            .output()
-            .unwrap()
+    assert_eq!(s.count(), "xx");
+    run("two", &["a", "b c"]);
+    run("two", &["a", "b c"]);
+    assert_eq!(s.count(), "xxx", "--key");
+    let sub = s.path("sub");
+    fs::create_dir(&sub).unwrap();
+    let mut command = s.command();
+    command.current_dir(&sub).args([
+        "--ttl", "1h", "--key", "two", "--", CHILD, "count", "args", "a", "b c",
+    ]);
+    assert_eq!(code(&s.spawn("in sub", command).finish()), Some(0));
+    assert_eq!(
+        fs::read_to_string(sub.join("count")).unwrap(),
+        "x",
+        "working directory"
+    );
+    let environment = |value: &str| {
+        let mut command = s.cacheexec(&["--ttl", "1h"], &["env:VALUE"]);
+        command.env("VALUE", value);
+        s.spawn("environment", command).finish()
     };
-    assert_eq!(envrun("one").stdout, b"one");
-    assert_eq!(envrun("two").stdout, b"one");
+    assert_eq!(
+        environment("one").stdout,
+        b"one",
+        "the child inherits the environment"
+    );
+    assert_eq!(
+        environment("two").stdout,
+        b"one",
+        "the environment is not keyed"
+    );
 }
+
 #[test]
 fn drains_large_outputs_and_closes_stdin() {
-    let f = Fixture::new();
-    let script = "test -z \"$(cat)\" || exit 9; (dd if=/dev/zero bs=65536 count=32 2>/dev/null) & dd if=/dev/zero bs=65536 count=32 1>&2 2>/dev/null; wait";
-    let first = f.run(&["--ttl", "1h"], script);
-    assert!(first.status.success());
+    let s = Sandbox::new();
+    // Both streams exceed a pipe buffer and are written concurrently.
+    let steps = ["stdin-empty:9", "zeros:2097152:2097152"];
+    // cacheexec's own stdin has data, which the child must not see.
+    let (stdin, input) = common::pipe();
+    fs::File::from(input).write_all(b"input").unwrap();
+    let mut command = s.cacheexec(&["--ttl", "1h"], &steps);
+    command.stdin(stdin);
+    let first = s.spawn("run", command).finish();
+    assert_eq!(code(&first), Some(0), "the child's stdin was not empty");
     assert_eq!(first.stdout.len(), 2_097_152);
     assert_eq!(first.stderr.len(), 2_097_152);
-    let hit = f.run(&["--ttl", "1h"], script);
-    assert_eq!(first.stdout, hit.stdout);
-    assert_eq!(first.stderr, hit.stderr);
+    let hit = s.run(&["--ttl", "1h"], &steps);
+    assert!(hit.stdout == first.stdout && hit.stderr == first.stderr);
 }
+
 #[test]
 fn failures_do_not_restore_old_results_or_repeat_child() {
-    let f = Fixture::new();
-    let script =
-        "printf x >> count; if test -f fail; then rm -r cache; printf blocked > cache; fi; exit 7";
-    assert_eq!(f.run(&["--ttl", "1h"], script).status.code(), Some(7));
-    fs::write(f.root.path().join("fail"), "").unwrap();
-    let failed = f.run(&["--ttl", "1h", "--refresh"], script);
-    assert_eq!(failed.status.code(), Some(125));
-    assert!(
-        String::from_utf8_lossy(&failed.stderr)
-            .contains("child already completed with exit code 7")
+    let s = Sandbox::new();
+    let steps = ["count", "event:started", "wait:go", "exit:7"];
+    let mut go = s.gate("go");
+    go.release();
+    assert_eq!(code(&s.run(&["--ttl", "1h"], &steps)), Some(7));
+    let mut go = s.gate("go");
+    let refresh = s.spawn(
+        "refresh",
+        s.cacheexec(&["--ttl", "1h", "--refresh"], &steps),
     );
-    assert_eq!(f.count(), "xx");
-    fs::remove_file(f.root.path().join("cache")).unwrap();
-    fs::remove_file(f.root.path().join("fail")).unwrap();
-    assert_eq!(f.run(&["--ttl", "1h"], script).status.code(), Some(7));
-    assert_eq!(f.count(), "xxx");
+    s.wait_event("started");
+    // Saving fails: the cache directory is replaced while the child runs.
+    fs::remove_dir_all(s.cache()).unwrap();
+    fs::write(s.cache(), "blocked").unwrap();
+    go.release();
+    let failed = refresh.finish();
+    assert_eq!(code(&failed), Some(125));
+    assert!(
+        stderr(&failed).contains("child already completed with exit code 7"),
+        "{}",
+        stderr(&failed)
+    );
+    assert_eq!(s.count(), "xx", "the child was repeated");
+    fs::remove_file(s.cache()).unwrap();
+    assert_eq!(code(&s.run(&["--ttl", "1h"], &steps)), Some(7));
+    assert_eq!(s.count(), "xxx", "an old result was restored");
 }
+
 #[test]
 fn corruption_is_an_error_and_never_executes_child() {
-    let f = Fixture::new();
-    f.run(&["--ttl", "1h"], SCRIPT);
-    fs::write(f.result(), "partial").unwrap();
-    for refresh in [false, true] {
-        let mut opts = vec!["--ttl", "1h"];
-        if refresh {
-            opts.push("--refresh");
+    let s = Sandbox::new();
+    s.run(&["--ttl", "1h"], &BYTES);
+    let result = s.cache_file("result");
+    fs::write(&result, "partial").unwrap();
+    for options in [&["--ttl", "1h"][..], &["--ttl", "1h", "--refresh"][..]] {
+        let output = s.run(options, &BYTES);
+        assert_eq!(code(&output), Some(125), "{options:?}");
+        let diagnostic = stderr(&output);
+        for expected in [
+            "corrupt cached result",
+            result.to_str().unwrap(),
+            "stop all cacheexec invocations",
+            "remove only this .result file",
+            "keep .lock and .active files",
+        ] {
+            assert!(diagnostic.contains(expected), "{options:?}: {diagnostic}");
         }
-        let output = f.run(&opts, SCRIPT);
-        assert_eq!(output.status.code(), Some(125));
-        let diagnostic = String::from_utf8_lossy(&output.stderr);
-        assert!(diagnostic.contains("corrupt cached result"));
-        assert!(diagnostic.contains(f.result().to_str().unwrap()));
-        assert!(diagnostic.contains("stop all cacheexec invocations"));
-        assert!(diagnostic.contains("remove only this .result file"));
-        assert!(diagnostic.contains("keep .lock and .active files"));
     }
-    let clear = f.command().arg("--clear").output().unwrap();
-    assert_eq!(clear.status.code(), Some(125));
-    let diagnostic = String::from_utf8_lossy(&clear.stderr);
-    assert!(diagnostic.contains(f.result().to_str().unwrap()));
-    assert!(diagnostic.contains("Recovery:"));
-    assert_eq!(f.count(), "x");
-    fs::remove_file(f.result()).unwrap();
-    assert!(f.run(&["--ttl", "1h"], SCRIPT).status.success());
-    assert_eq!(f.count(), "xx");
+    let cleared = s.clear(&[]);
+    assert_eq!(code(&cleared), Some(125));
+    assert!(
+        stderr(&cleared).contains(result.to_str().unwrap()),
+        "{}",
+        stderr(&cleared)
+    );
+    assert!(
+        stderr(&cleared).contains("Recovery:"),
+        "{}",
+        stderr(&cleared)
+    );
+    assert_eq!(s.count(), "x");
+    fs::remove_file(&result).unwrap();
+    assert_eq!(code(&s.run(&["--ttl", "1h"], &BYTES)), Some(0));
+    assert_eq!(s.count(), "xx");
 }
+
 #[test]
 fn spawn_failure_and_signals_are_not_cached() {
-    let f = Fixture::new();
-    let program = f.root.path().join("program");
-    fs::write(&program, "#!/bin/sh\nprintf x >> count\n").unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
-    let run = |refresh| {
-        let mut cmd = f.command();
-        cmd.args(["--ttl", "1h"]);
+    let s = Sandbox::new();
+    let program = s.path("program");
+    std::os::unix::fs::symlink(CHILD, &program).unwrap();
+    let run = |refresh: bool| {
+        let mut command = s.command();
+        command.args(["--ttl", "1h"]);
         if refresh {
-            cmd.arg("--refresh");
+            command.arg("--refresh");
         }
-        cmd.arg("--").arg(&program).output().unwrap()
+        command.arg("--").arg(&program).arg("count");
+        s.spawn("run", command).finish()
     };
-    assert!(run(false).status.success());
+    let first = run(false);
+    assert_eq!(code(&first), Some(0), "{}", stderr(&first));
     fs::remove_file(&program).unwrap();
     for refresh in [true, false] {
         let output = run(refresh);
-        assert_eq!(output.status.code(), Some(125));
+        assert_eq!(code(&output), Some(125), "refresh={refresh}");
         assert_eq!(
-            String::from_utf8_lossy(&output.stderr)
-                .matches("could not start")
-                .count(),
-            1
+            stderr(&output).matches("could not start").count(),
+            1,
+            "{}",
+            stderr(&output)
         );
     }
-    let script = "printf x >> count; kill -TERM $$";
-    assert_eq!(f.run(&["--ttl", "1h"], script).status.code(), Some(143));
-    assert_eq!(f.run(&["--ttl", "1h"], script).status.code(), Some(143));
-    assert_eq!(f.count(), "xxx");
+    let killed = ["count", "raise:TERM"];
+    assert_eq!(code(&s.run(&["--ttl", "1h"], &killed)), Some(143));
+    assert_eq!(code(&s.run(&["--ttl", "1h"], &killed)), Some(143));
+    assert_eq!(s.count(), "xxx", "a signal termination was cached");
 }
+
 #[test]
 fn output_transfer_failure_is_reported_once() {
-    use std::process::Stdio;
-    let f = Fixture::new();
-    let mut child = f
-        .command()
-        .args([
-            "--ttl",
-            "1h",
-            "--",
-            "sh",
-            "-c",
-            "while ! test -f go; do sleep 0.01; done; printf output",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    drop(child.stdout.take());
-    fs::write(f.root.path().join("go"), "").unwrap();
-    let output = child.wait_with_output().unwrap();
-    assert_eq!(output.status.code(), Some(125));
-    let diagnostic = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(diagnostic.matches("output transfer failed").count(), 1);
-    assert_eq!(diagnostic.matches("child already completed").count(), 1);
+    let s = Sandbox::new();
+    let mut command = s.cacheexec(&["--ttl", "1h"], &["out:output"]);
+    command.stdout(common::closed_pipe());
+    let output = s.spawn("closed stdout", command).finish();
+    assert_eq!(code(&output), Some(125));
+    let diagnostic = stderr(&output);
+    assert_eq!(
+        diagnostic.matches("output transfer failed").count(),
+        1,
+        "{diagnostic}"
+    );
+    assert_eq!(
+        diagnostic.matches("child already completed").count(),
+        1,
+        "{diagnostic}"
+    );
 }
+
 #[test]
 fn storage_access_errors_are_diagnosed() {
-    let f = Fixture::new();
-    f.run(&["--ttl", "1h"], SCRIPT);
-    let path = f.result();
-    fs::remove_file(&path).unwrap();
-    fs::create_dir(&path).unwrap();
-    let output = f.run(&["--ttl", "1h"], SCRIPT);
-    assert_eq!(output.status.code(), Some(125));
-    assert_eq!(f.count(), "x");
+    let s = Sandbox::new();
+    s.run(&["--ttl", "1h"], &BYTES);
+    let result = s.cache_file("result");
+    fs::remove_file(&result).unwrap();
+    fs::create_dir(&result).unwrap();
+    let output = s.run(&["--ttl", "1h"], &BYTES);
+    assert_eq!(code(&output), Some(125));
+    assert!(
+        stderr(&output).contains("read cached result"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(s.count(), "x");
 }
+
 #[test]
-fn xdg_and_home_defaults_and_required_arguments() {
-    let f = Fixture::new();
-    for xdg in [true, false] {
-        let directory = f.root.path().join(if xdg { "xdg" } else { "home" });
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_cacheexec"));
-        cmd.env("HOME", &directory).env_remove("XDG_CACHE_HOME");
-        if xdg {
-            cmd.env("XDG_CACHE_HOME", &directory);
+fn default_cache_directory_follows_xdg_then_home() {
+    let s = Sandbox::new();
+    let run = |xdg: Option<&str>, home: Option<&std::path::Path>| {
+        let mut command = s.bare_command();
+        command
+            .env_remove("XDG_CACHE_HOME")
+            .env_remove("HOME")
+            .args(["--ttl", "1h", "--", CHILD, "exit:0"]);
+        if let Some(xdg) = xdg {
+            command.env("XDG_CACHE_HOME", xdg);
         }
-        assert!(
-            cmd.args(["--ttl", "1h", "--", "true"])
-                .status()
-                .unwrap()
-                .success()
-        );
-        assert!(
-            directory
-                .join(if xdg { "cacheexec" } else { ".cache/cacheexec" })
-                .is_dir()
-        );
-    }
+        if let Some(home) = home {
+            command.env("HOME", home);
+        }
+        s.spawn("default directory", command).finish()
+    };
+    let xdg = s.path("xdg");
+    let home = s.path("home");
+    assert_eq!(
+        code(&run(Some(xdg.to_str().unwrap()), Some(&home))),
+        Some(0)
+    );
+    assert!(
+        xdg.join("cacheexec").is_dir(),
+        "XDG_CACHE_HOME was not used"
+    );
+    assert!(!home.exists());
+    assert_eq!(code(&run(None, Some(&home))), Some(0));
+    assert!(home.join(".cache/cacheexec").is_dir(), "HOME was not used");
+}
+
+#[test]
+fn required_arguments_are_argument_errors() {
+    let s = Sandbox::new();
     for args in [
-        vec!["--", "true"],
-        vec!["--ttl", "invalid", "--", "true"],
-        vec!["--ttl", "1h", "true"],
+        &["--", CHILD][..],
+        &["--ttl", "invalid", "--", CHILD],
+        &["--ttl", "1h", CHILD],
     ] {
+        let mut command = s.command();
+        command.args(args);
         assert_eq!(
-            f.command().args(args).output().unwrap().status.code(),
-            Some(2)
+            code(&s.spawn("arguments", command).finish()),
+            Some(2),
+            "{args:?}"
         );
     }
 }
 
 #[test]
 fn clear_all_age_directory_isolation_and_condition_fixture() {
-    for code in [0, 1, 7] {
-        let f = Fixture::new();
+    for exit in ["0", "1", "7"] {
+        let s = Sandbox::new();
         let run = || {
-            f.command()
-                .env("CODE", code.to_string())
-                .args([
-                    "--ttl",
-                    "5m",
-                    "--include-codes",
-                    "0,1",
-                    "--",
-                    "sh",
-                    "-c",
-                    SCRIPT,
-                ])
-                .output()
-                .unwrap()
+            let mut command = s.cacheexec(
+                &["--ttl", "5m", "--include-codes", "0,1"],
+                &with(&BYTES, &["exitenv:CODE"]),
+            );
+            command.env("CODE", exit);
+            s.spawn("run", command).finish()
         };
-        assert_eq!(run().status.code(), Some(code));
-        assert_eq!(run().status.code(), Some(code));
-        assert_eq!(f.count(), if code == 7 { "xx" } else { "x" });
-        let recent = f
-            .command()
-            .args(["--clear", "--older-than", "1h"])
-            .output()
-            .unwrap();
-        assert!(recent.status.success());
-        assert!(String::from_utf8_lossy(&recent.stdout).contains("removed=0"));
-        let other = Command::new(env!("CARGO_BIN_EXE_cacheexec"))
-            .arg("--cache-dir")
-            .arg(f.root.path().join("other"))
-            .arg("--clear")
-            .output()
-            .unwrap();
-        assert!(other.status.success());
-        assert!(!f.root.path().join("other").exists());
-        let clear = f.command().arg("--clear").output().unwrap();
-        assert!(clear.status.success());
+        let clear = |options: &[&str]| {
+            let output = s.clear(options);
+            assert_eq!(code(&output), Some(0), "{}", stderr(&output));
+            stdout(&output)
+        };
+        let saved = exit != "7";
+        assert_eq!(code(&run()), exit.parse().ok());
+        assert_eq!(code(&run()), exit.parse().ok());
+        assert_eq!(s.count(), if saved { "x" } else { "xx" }, "exit {exit}");
         assert!(
-            String::from_utf8_lossy(&clear.stdout).contains(if code == 7 {
-                "removed=0"
-            } else {
-                "removed=1"
-            })
+            clear(&["--older-than", "1h"]).contains("removed=0"),
+            "exit {exit}"
         );
-        assert_eq!(run().status.code(), Some(code));
-        assert_eq!(f.count(), if code == 7 { "xxx" } else { "xx" });
-        let expired = f
-            .command()
-            .args(["--clear", "--older-than", "0s"])
-            .output()
-            .unwrap();
-        assert!(expired.status.success());
+        let mut other = s.bare_command();
+        other.arg("--cache-dir").arg(s.path("other")).arg("--clear");
+        assert_eq!(code(&s.spawn("clear other", other).finish()), Some(0));
         assert!(
-            !fs::read_dir(f.root.path().join("cache"))
-                .unwrap()
-                .any(|entry| entry
-                    .unwrap()
-                    .path()
-                    .extension()
-                    .is_some_and(|e| e == "result"))
+            !s.path("other").exists(),
+            "--clear created a missing directory"
         );
+        let removed = if saved { "removed=1" } else { "removed=0" };
+        assert!(clear(&[]).contains(removed), "exit {exit}");
+        assert_eq!(code(&run()), exit.parse().ok());
+        assert_eq!(s.count(), if saved { "xx" } else { "xxx" }, "exit {exit}");
+        clear(&["--older-than", "0s"]);
+        assert!(s.cache_files("result").is_empty(), "exit {exit}");
     }
 }
 
 #[test]
 fn clear_reports_partial_failure_and_preserves_corruption() {
-    let f = Fixture::new();
-    f.run(&["--ttl", "1h"], "true");
-    let broken = f
-        .root
-        .path()
-        .join("cache")
-        .join(format!("{}.result", "0".repeat(64)));
+    let s = Sandbox::new();
+    s.run(&["--ttl", "1h"], &["exit:0"]);
+    let broken = s.cache().join(format!("{}.result", "0".repeat(64)));
     fs::write(&broken, "corrupt").unwrap();
-    let output = f.command().arg("--clear").output().unwrap();
-    assert_eq!(output.status.code(), Some(125));
-    let diagnostic = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        diagnostic.contains("removed=1")
-            && diagnostic.contains("failed=1")
-            && diagnostic.contains("corrupt")
-    );
-    assert!(broken.exists());
+    let clear = |args: &[&str]| {
+        let mut command = s.command();
+        command.args(args);
+        s.spawn("clear", command).finish()
+    };
+    let output = clear(&["--clear"]);
+    assert_eq!(code(&output), Some(125));
+    for expected in ["removed=1", "failed=1", "corrupt"] {
+        assert!(stderr(&output).contains(expected), "{}", stderr(&output));
+    }
+    assert!(broken.exists(), "a corrupt result was deleted");
     fs::remove_file(&broken).unwrap();
     fs::create_dir(&broken).unwrap();
-    assert_eq!(
-        f.command().arg("--clear").output().unwrap().status.code(),
-        Some(125)
-    );
+    assert_eq!(code(&clear(&["--clear"])), Some(125));
     for args in [
-        vec!["--clear", "--ttl", "1h"],
-        vec!["--older-than", "1h"],
-        vec!["--clear", "--", "true"],
+        &["--clear", "--ttl", "1h"][..],
+        &["--older-than", "1h"],
+        &["--clear", "--", CHILD],
     ] {
-        assert_eq!(
-            f.command().args(args).output().unwrap().status.code(),
-            Some(2)
-        );
+        assert_eq!(code(&clear(args)), Some(2), "{args:?}");
     }
 }
 
 #[test]
 fn clear_permission_failure_is_explicit() {
-    use std::os::unix::fs::PermissionsExt;
+    let s = Sandbox::new();
+    s.run(&["--ttl", "1h"], &["exit:0"]);
+    let cache = s.cache();
+    let output = {
+        let _read_only = Mode::set(&cache, 0o555);
+        s.clear(&[])
+    };
     if unsafe { libc::geteuid() } == 0 {
+        // Root may delete from a read-only directory; nothing to check.
         return;
     }
-    let f = Fixture::new();
-    f.run(&["--ttl", "1h"], "true");
-    let directory = f.root.path().join("cache");
-    fs::set_permissions(&directory, fs::Permissions::from_mode(0o555)).unwrap();
-    let output = f.command().arg("--clear").output().unwrap();
-    fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
-    assert_eq!(output.status.code(), Some(125));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("delete cached result"));
-    assert!(f.result().exists());
-}
-
-fn diagnostics(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
+    assert_eq!(code(&output), Some(125));
+    assert!(
+        stderr(&output).contains("delete cached result"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(s.cache_file("result").exists());
 }
 
 #[test]
 fn verbose_decisions_reasons_metadata_and_uncached_output() {
-    use sha2::{Digest, Sha256};
-    let f = Fixture::new();
-    let script = "printf x >> count; printf out; printf 'child-error\n' >&2; exit 7";
+    let s = Sandbox::new();
+    // `child-error\n` on stderr.
+    let steps = [
+        "count",
+        "out:out",
+        "errx:6368696c642d6572726f720a",
+        "exit:7",
+    ];
     let run = |options: &[&str]| {
-        let mut args = vec!["--verbose", "--ttl", "1h"];
-        args.extend(options);
-        f.run(&args, script)
+        let mut all = vec!["--verbose", "--ttl", "1h"];
+        all.extend(options);
+        s.run(&all, &steps)
     };
     let first = run(&[]);
-    let text = diagnostics(&first);
-    assert!(text.contains("run reason=missing ttl=1h key="), "{text}");
-    assert!(!text.contains(" age="));
-    assert!(text.contains("completed exit=7 saved=yes"));
-    assert!(text.contains(&format!("cache-dir={:?}", f.root.path().join("cache"))));
-    let key = f.result().file_stem().unwrap().to_str().unwrap().to_owned();
-    assert!(text.contains(&format!("key={key}")));
-    let hit = run(&[]);
-    let text = diagnostics(&hit);
-    assert!(text.contains("hit age="));
-    assert!(text.contains("saved=no reason=reused"));
-    assert_eq!(hit.stdout, b"out");
-    assert_eq!(f.count(), "x");
-    let quiet = f.run(&["--ttl", "1h"], script);
-    assert_eq!(quiet.stderr, b"child-error\n");
-    let bytes = fs::read(f.result()).unwrap();
+    let lines = verbose_lines(&first.stderr);
+    let text = stderr(&first);
     assert!(
-        !bytes
-            .windows(b"cacheexec: verbose:".len())
-            .any(|w| w == b"cacheexec: verbose:")
+        lines[0].starts_with("run reason=missing ttl=1h key="),
+        "{text}"
+    );
+    assert!(!text.contains(" age="), "{text}");
+    assert!(text.contains("completed exit=7 saved=yes"), "{text}");
+    assert!(
+        text.contains(&format!("cache-dir={:?}", s.cache())),
+        "{text}"
+    );
+    let result = s.cache_file("result");
+    let key = result.file_stem().unwrap().to_str().unwrap().to_owned();
+    assert!(text.contains(&format!("key={key}")), "{text}");
+    let hit = run(&[]);
+    let text = stderr(&hit);
+    assert!(text.contains("hit age="), "{text}");
+    assert!(text.contains("saved=no reason=reused"), "{text}");
+    assert_eq!(hit.stdout, b"out");
+    assert_eq!(s.count(), "x");
+    let quiet = s.run(&["--ttl", "1h"], &steps);
+    assert_eq!(
+        quiet.stderr, b"child-error\n",
+        "diagnostics without --verbose"
+    );
+    let bytes = fs::read(&result).unwrap();
+    assert!(
+        common::find(&bytes, b"cacheexec: verbose:").is_none(),
+        "diagnostics were stored in the result"
     );
     assert_eq!(&bytes[..8], b"CEXEC001");
-    let completed = u128::from_le_bytes(bytes[8..24].try_into().unwrap());
-    let age = text
+    let age: f64 = text
         .split("age=")
         .nth(1)
         .unwrap()
         .split('s')
         .next()
         .unwrap()
-        .parse::<f64>()
+        .parse()
         .unwrap();
-    let actual_age = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let actual_age = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs_f64()
-        - completed as f64 / 1e9;
-    assert!(age >= 0.0 && age <= actual_age && actual_age - age < 1.0);
-    let policy = run(&["--include-codes", "0"]);
-    assert!(diagnostics(&policy).contains("run reason=policy age="));
-    assert!(diagnostics(&policy).contains("completed exit=7 saved=no reason=participant-policy"));
-    assert_eq!(f.count(), "xx");
-    assert!(diagnostics(&run(&[])).contains("run reason=missing"));
+        - stored_completion(&bytes) as f64 / 1e9;
     assert!(
-        diagnostics(&run(&["--refresh", "--include-codes", "0"]))
-            .contains("run reason=refresh age=")
+        age >= 0.0 && age <= actual_age && actual_age - age < 1.0,
+        "age={age} actual={actual_age}"
+    );
+    let policy = run(&["--include-codes", "0"]);
+    assert!(
+        stderr(&policy).contains("run reason=policy age="),
+        "{}",
+        stderr(&policy)
+    );
+    assert!(stderr(&policy).contains("completed exit=7 saved=no reason=participant-policy"));
+    assert_eq!(s.count(), "xx");
+    assert!(stderr(&run(&[])).contains("run reason=missing"));
+    let refreshed = run(&["--refresh", "--include-codes", "0"]);
+    assert!(
+        stderr(&refreshed).contains("run reason=refresh age="),
+        "{}",
+        stderr(&refreshed)
     );
     run(&[]);
-    let expired = f.run(
+    let expired = s.run(
         &["--verbose", "--ttl", "0s", "--include-codes", "0"],
-        script,
+        &steps,
     );
-    assert!(diagnostics(&expired).contains("run reason=expired age="));
+    assert!(
+        stderr(&expired).contains("run reason=expired age="),
+        "{}",
+        stderr(&expired)
+    );
     run(&[]);
-    let mut future = fs::read(f.result()).unwrap();
-    let nanos = (std::time::SystemTime::now() + Duration::from_secs(3600))
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    future[8..24].copy_from_slice(&nanos.to_le_bytes());
-    let end = future.len() - 32;
-    let checksum = Sha256::digest(&future[..end]);
-    future[end..].copy_from_slice(&checksum);
-    fs::write(f.result(), &future).unwrap();
+    set_completion(&result, SystemTime::now() + Duration::from_secs(3600));
     let future_output = run(&["--include-codes", "0"]);
-    assert!(diagnostics(&future_output).contains("run reason=future-timestamp age=-"));
-    assert_eq!(f.count(), "xxxxxxxx");
+    assert!(
+        stderr(&future_output).contains("run reason=future-timestamp age=-"),
+        "{}",
+        stderr(&future_output)
+    );
+    assert_eq!(s.count(), "xxxxxxxx");
     for output in [first, hit, policy, expired, future_output] {
-        assert_eq!(output.status.code(), Some(7));
-        assert!(diagnostics(&output).contains(&format!("key={key}")));
+        assert_eq!(code(&output), Some(7));
+        assert!(
+            stderr(&output).contains(&format!("key={key}")),
+            "{}",
+            stderr(&output)
+        );
     }
 }
 
 #[test]
 fn verbose_keys_and_escaped_paths_do_not_disclose_inputs() {
-    let f = Fixture::new();
-    let directory = f.root.path().join("cache\nforged\r\x1b");
-    let run = |key, cwd: &std::path::Path, options: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_cacheexec"))
+    let s = Sandbox::new();
+    let directory = s.path("cache\nforged\r\x1b");
+    let run = |key: &str, cwd: &std::path::Path, options: &[&str]| {
+        let mut command = s.bare_command();
+        command
             .current_dir(cwd)
             .env("PRIVATE_VALUE", "environment-secret")
             .arg("--cache-dir")
             .arg(&directory)
             .args(["--ttl", "1h", "--verbose", "--key", key])
             .args(options)
-            .args(["--", "sh", "-c", "true", "argument-secret"])
-            .output()
-            .unwrap()
+            .args(["--", CHILD, "exit:0", "argument-secret"]);
+        s.spawn("run", command).finish()
     };
-    let a = run("key-secret", f.root.path(), &[]);
-    let b = run("another-key", f.root.path(), &[]);
-    let sub = f.root.path().join("sub");
+    let a = run("key-secret", s.root(), &[]);
+    let b = run("another-key", s.root(), &[]);
+    let sub = s.path("sub");
     fs::create_dir(&sub).unwrap();
     let c = run("key-secret", &sub, &[]);
     let d = run(
         "key-secret",
-        f.root.path(),
+        s.root(),
         &["--refresh", "--exclude-codes", "1"],
     );
     let key = |output: &Output| {
-        diagnostics(output)
+        stderr(output)
             .split("key=")
             .nth(1)
             .unwrap()
@@ -597,20 +687,18 @@ fn verbose_keys_and_escaped_paths_do_not_disclose_inputs() {
             .unwrap()
             .to_owned()
     };
-    assert_ne!(key(&a), key(&b));
-    assert_ne!(key(&a), key(&c));
-    assert_eq!(key(&a), key(&d));
+    assert_ne!(key(&a), key(&b), "--key");
+    assert_ne!(key(&a), key(&c), "working directory");
+    assert_eq!(key(&a), key(&d), "refresh and code selection");
     for output in [a, b, c, d] {
-        let text = diagnostics(&output);
-        assert_eq!(
-            text.lines().filter(|line| !line.is_empty()).count(),
-            2,
-            "{text}"
-        );
+        let text = stderr(&output);
+        let lines: Vec<_> = text.lines().filter(|line| !line.is_empty()).collect();
+        assert_eq!(lines.len(), 2, "{text}");
         assert!(
-            text.lines()
-                .filter(|line| !line.is_empty())
-                .all(|line| line.starts_with("cacheexec: verbose: "))
+            lines
+                .iter()
+                .all(|line| line.starts_with("cacheexec: verbose: ")),
+            "{text}"
         );
         assert!(text.contains("cache\\nforged\\r\\u{1b}"), "{text}");
         for secret in [
@@ -619,99 +707,121 @@ fn verbose_keys_and_escaped_paths_do_not_disclose_inputs() {
             "environment-secret",
             "argument-secret",
         ] {
-            assert!(!text.contains(secret));
+            assert!(!text.contains(secret), "{secret} disclosed: {text}");
         }
     }
 }
 
 #[test]
 fn verbose_failure_interrupt_and_cli_contracts() {
-    let f = Fixture::new();
-    let missing = f
-        .command()
-        .args(["--ttl", "1h", "--verbose", "--", "./does-not-exist"])
-        .output()
-        .unwrap();
-    assert_eq!(missing.status.code(), Some(125));
-    assert!(diagnostics(&missing).contains("failed saved=no reason=failure"));
-    assert!(!diagnostics(&missing).contains("completed exit="));
-    let interrupted = f.run(&["--ttl", "1h", "--verbose"], "kill -TERM $$");
-    assert_eq!(interrupted.status.code(), Some(143));
-    assert!(diagnostics(&interrupted).contains("interrupted exit=143 saved=no reason=interrupted"));
-    assert_eq!(
-        f.command()
-            .args(["--clear", "--verbose"])
-            .output()
-            .unwrap()
-            .status
-            .code(),
-        Some(2)
-    );
-    let help = f.command().arg("--help").output().unwrap();
-    let help = String::from_utf8_lossy(&help.stdout);
+    let s = Sandbox::new();
+    let mut command = s.command();
+    command.args(["--ttl", "1h", "--verbose", "--", "./does-not-exist"]);
+    let missing = s.spawn("missing program", command).finish();
+    assert_eq!(code(&missing), Some(125));
     assert!(
-        help.contains("cacheexec --ttl <TTL> [OPTIONS] -- <COMMAND>...")
-            && help.contains("cacheexec --clear [--older-than <DURATION>] [--cache-dir <PATH>]")
-            && help.contains("--verbose")
-            && help.contains("stderr")
-            && help.contains("best effort")
-            && help.contains("not a stable format")
+        stderr(&missing).contains("failed saved=no reason=failure"),
+        "{}",
+        stderr(&missing)
     );
+    assert!(!stderr(&missing).contains("completed exit="));
+    let interrupted = s.run(&["--ttl", "1h", "--verbose"], &["raise:TERM"]);
+    assert_eq!(code(&interrupted), Some(143));
+    assert!(
+        stderr(&interrupted).contains("interrupted exit=143 saved=no reason=interrupted"),
+        "{}",
+        stderr(&interrupted)
+    );
+    let mut command = s.command();
+    command.args(["--clear", "--verbose"]);
+    assert_eq!(code(&s.spawn("clear verbose", command).finish()), Some(2));
+    let mut command = s.command();
+    command.arg("--help");
+    let help = stdout(&s.spawn("help", command).finish());
+    for expected in [
+        "cacheexec --ttl <TTL> [OPTIONS] -- <COMMAND>...",
+        "cacheexec --clear [--older-than <DURATION>] [--cache-dir <PATH>]",
+        "--verbose",
+        "stderr",
+        "best effort",
+        "not a stable format",
+    ] {
+        assert!(
+            help.contains(expected),
+            "{expected:?} missing from help:\n{help}"
+        );
+    }
 }
 
 #[test]
 fn verbose_completion_has_its_own_line_after_unterminated_child_stderr() {
-    let f = Fixture::new();
-    let script = "printf x >> count; printf child >&2";
-    for _ in 0..2 {
-        let output = f.run(&["--verbose", "--ttl", "1h"], script);
-        let text = diagnostics(&output);
+    let s = Sandbox::new();
+    let steps = ["count", "err:child"];
+    for name in ["run", "hit"] {
+        let output = s.run(&["--verbose", "--ttl", "1h"], &steps);
+        let text = stderr(&output);
         assert!(
             text.contains("child\n") && text.contains("\ncacheexec: verbose: completed exit=0"),
-            "{text}"
+            "{name}: {text}"
         );
-        assert_eq!(
-            text.lines()
-                .filter(|line| line.starts_with("cacheexec: verbose:"))
-                .count(),
-            2
-        );
+        assert_eq!(verbose_lines(&output.stderr).len(), 2, "{name}: {text}");
     }
-    assert_eq!(f.run(&["--ttl", "1h"], script).stderr, b"child");
-    assert_eq!(f.count(), "x");
+    assert_eq!(s.run(&["--ttl", "1h"], &steps).stderr, b"child");
+    assert_eq!(s.count(), "x");
 }
 
 #[test]
 fn verbose_delayed_decisions_keep_line_boundaries_during_concurrent_replay() {
-    use std::process::Stdio;
-    let f = Fixture::new();
-    let script = "printf x >> count; printf child >&2";
-    f.run(&["--ttl", "1h"], script);
+    let s = Sandbox::new();
+    let steps = ["count", "err:child"];
+    s.run(&["--ttl", "1h"], &steps);
+    let mut decisions = 0;
     for _ in 0..4 {
-        let callers: Vec<_> = (0..32)
-            .map(|_| {
-                f.command()
-                    .args(["--verbose", "--ttl", "1h", "--", "sh", "-c", script])
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap()
-            })
+        let callers: Vec<_> = (0..16)
+            .map(|_| s.spawn("hit", s.cacheexec(&["--verbose", "--ttl", "1h"], &steps)))
             .collect();
         for caller in callers {
-            let output = caller.wait_with_output().unwrap();
-            assert!(output.status.success());
-            let text = diagnostics(&output);
-            assert!(text.contains("hit age="), "{text}");
-            assert_eq!(text.matches("cacheexec: verbose:").count(), 2, "{text}");
+            let output = caller.finish();
+            let text = stderr(&output);
+            assert_eq!(code(&output), Some(0), "{text}");
+            // Diagnostics are best effort and may be dropped under load, but
+            // whatever is written starts on its own line and is complete.
+            assert_eq!(common::child_stderr(&output.stderr), b"child", "{text}");
+            let lines = verbose_lines(&output.stderr);
+            assert!(lines.len() <= 2, "{text}");
             assert_eq!(
-                text.lines()
-                    .filter(|line| line.starts_with("cacheexec: verbose:"))
-                    .count(),
-                2,
+                text.matches("cacheexec: verbose:").count(),
+                lines.len(),
                 "{text}"
             );
+            for line in lines {
+                assert!(
+                    line.starts_with("hit age=") || line.starts_with("completed exit=0 "),
+                    "malformed diagnostic {line:?} in {text}"
+                );
+                decisions += usize::from(line.starts_with("hit age="));
+            }
         }
     }
-    assert_eq!(f.count(), "x");
+    assert!(decisions > 0, "no caller reported its decision");
+    assert_eq!(s.count(), "x");
+}
+
+/// Changes a path's mode and restores 0o755 when dropped, even on failure, so
+/// the sandbox stays removable.
+struct Mode<'a>(&'a std::path::Path);
+
+impl<'a> Mode<'a> {
+    fn set(path: &'a std::path::Path, mode: u32) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for Mode<'_> {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(self.0, fs::Permissions::from_mode(0o755));
+    }
 }
