@@ -329,24 +329,14 @@ fn own(
     unlock(&active)?;
     unlock(gate)?;
     let (code, saving, delivery) = outcome?;
-    match delivery.finish(code) {
-        Ok(code) => {
-            let kind = if saving == Saving::Interrupted || signals::received() != 0 {
-                "interrupted"
-            } else {
-                "completed"
-            };
-            diagnostic.finish(format!("{kind} exit={code} saved={}", saving.describe()));
-            Ok(code)
-        }
-        Err(error) => {
-            diagnostic.finish(format!(
-                "failed saved={} reason=delivery-failure",
-                saving.describe()
-            ));
-            Err(error)
-        }
-    }
+    report(
+        delivery.finish(code),
+        code,
+        saving.describe(),
+        saving == Saving::Interrupted,
+        "delivery-failure",
+        diagnostic,
+    )
 }
 
 fn replay(
@@ -355,19 +345,65 @@ fn replay(
     interrupted: bool,
     diagnostic: &Verbose,
 ) -> Result<i32> {
-    let result = record.replay();
-    match &result {
-        Ok(code) => {
-            let kind = if interrupted || signals::received() != 0 {
-                "interrupted"
-            } else {
-                "completed"
-            };
+    let code = record.code;
+    report(
+        record.replay(),
+        code,
+        saving,
+        interrupted,
+        "replay-failure",
+        diagnostic,
+    )
+}
+
+fn report(
+    outcome: Result<i32>,
+    command_code: i32,
+    saving: &str,
+    generation_interrupted: bool,
+    failure: &str,
+    diagnostic: &Verbose,
+) -> Result<i32> {
+    // Sampled once so the exit status and its label cannot disagree.
+    let signal = signals::received();
+    match classify(outcome, command_code, signal, generation_interrupted) {
+        Ok((code, kind)) => {
             diagnostic.finish(format!("{kind} exit={code} saved={saving}"));
+            Ok(code)
         }
-        Err(_) => diagnostic.finish(format!("failed saved={saving} reason=replay-failure")),
+        Err(error) => {
+            diagnostic.finish(format!("failed saved={saving} reason={failure}"));
+            Err(error)
+        }
     }
-    result
+}
+
+/// The exit status and completion label of a delivery or replay outcome.
+fn classify(
+    outcome: Result<i32>,
+    command_code: i32,
+    signal: i32,
+    generation_interrupted: bool,
+) -> Result<(i32, &'static str)> {
+    let (code, kind) = match outcome {
+        // A signal received during delivery ends it with 128 + signal however
+        // delivery ended, as Delivery::finish and Record::replay do.
+        _ if signal != 0 => (128 + signal, "interrupted"),
+        Ok(code) => (code, "completed"),
+        // A consumer such as `head` closing its end is a normal way to stop
+        // reading, not a tool failure. The status of the delivered result is
+        // still known, so it is reported; shared and saved results stay intact.
+        Err(error) if runner::output_closed(&error) => (command_code, "output-closed"),
+        Err(error) => return Err(error),
+    };
+    Ok((
+        code,
+        if generation_interrupted {
+            "interrupted"
+        } else {
+            kind
+        },
+    ))
 }
 
 fn stage(active: &mut File, execution: &runner::Execution, votes: &[u8; 256]) -> Result<()> {
@@ -399,6 +435,41 @@ fn apply_signal(execution: &mut runner::Execution, path: &Path, signal: i32) -> 
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    fn closed() -> anyhow::Error {
+        anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            .context("replay stdout")
+    }
+
+    #[test]
+    fn a_signal_during_delivery_wins_over_every_outcome() {
+        for outcome in [Ok(3), Err(closed()), Err(anyhow::anyhow!("disk full"))] {
+            let classified = classify(outcome, 3, libc::SIGTERM, false).unwrap();
+            assert_eq!(classified, (143, "interrupted"));
+        }
+    }
+
+    #[test]
+    fn a_closed_reader_keeps_the_command_status_and_other_failures_are_errors() {
+        assert_eq!(classify(Ok(7), 7, 0, false).unwrap(), (7, "completed"));
+        assert_eq!(
+            classify(Err(closed()), 7, 0, false).unwrap(),
+            (7, "output-closed")
+        );
+        assert!(classify(Err(anyhow::anyhow!("EIO")), 7, 0, false).is_err());
+    }
+
+    #[test]
+    fn an_interrupted_generation_is_labelled_interrupted() {
+        assert_eq!(
+            classify(Ok(143), 143, 0, true).unwrap(),
+            (143, "interrupted")
+        );
+        assert_eq!(
+            classify(Err(closed()), 143, 0, true).unwrap(),
+            (143, "interrupted")
+        );
+    }
 
     fn identity(file: &File) -> (u64, u64) {
         let metadata = file.metadata().unwrap();

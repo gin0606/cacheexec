@@ -403,9 +403,10 @@ fn spawn_failure_and_signals_are_not_cached() {
 #[test]
 fn output_transfer_failure_is_reported_once() {
     let s = Sandbox::new();
+    let full = common::FullPipe::new();
     let mut command = s.cacheexec(&["--ttl", "1h"], &["out:output"]);
-    command.stdout(common::closed_pipe());
-    let output = s.spawn("closed stdout", command).finish();
+    command.stdout(full.nonblocking());
+    let output = s.spawn("full stdout", command).finish();
     assert_eq!(code(&output), Some(125));
     let diagnostic = stderr(&output);
     assert_eq!(
@@ -418,6 +419,127 @@ fn output_transfer_failure_is_reported_once() {
         1,
         "{diagnostic}"
     );
+}
+
+/// Runs `cacheexec OPTIONS -- STEPS` with stdout and stderr replaced as given.
+fn run_to(
+    s: &Sandbox,
+    options: &[&str],
+    steps: &[&str],
+    stdout: Option<std::os::fd::OwnedFd>,
+    stderr: Option<std::os::fd::OwnedFd>,
+) -> Output {
+    let mut command = s.cacheexec(options, steps);
+    if let Some(stdout) = stdout {
+        command.stdout(stdout);
+    }
+    if let Some(stderr) = stderr {
+        command.stderr(stderr);
+    }
+    s.spawn("run", command).finish()
+}
+
+#[test]
+fn closed_output_exits_quietly_with_the_command_status_and_keeps_result() {
+    let s = Sandbox::new();
+    // A failing command, so its status is visibly kept rather than replaced.
+    let steps = ["count", "out:output", "err:warning", "exit:3"];
+    let options = ["--ttl", "1h", "--include-codes", "3"];
+    // The first call runs and saves; the second replays the saved result.
+    for saving in ["saved=yes", "saved=no reason=reused"] {
+        let verbose = with(&options, &["--verbose"]);
+        let output = run_to(&s, &verbose, &steps, Some(common::closed_pipe()), None);
+        assert_eq!(code(&output), Some(3), "{saving}");
+        assert_eq!(s.count(), "x", "{saving}");
+        // Stderr is still delivered in full, and no tool diagnostic is added.
+        assert_eq!(common::child_stderr(&output.stderr), b"warning", "{saving}");
+        assert_eq!(
+            verbose_lines(&output.stderr).last().map(String::as_str),
+            Some(format!("output-closed exit=3 {saving}").as_str()),
+            "{}",
+            stderr(&output)
+        );
+    }
+    let replayed = s.run(&options, &steps);
+    assert_eq!(code(&replayed), Some(3));
+    assert_eq!(replayed.stdout, b"output");
+    assert_eq!(replayed.stderr, b"warning");
+    assert_eq!(s.count(), "x");
+}
+
+#[test]
+fn closed_stderr_still_delivers_all_stdout() {
+    let s = Sandbox::new();
+    // More than a pipe holds, so a stalled stdout would block the child.
+    let steps = ["count", "zeros:4194304:0", "err:warning"];
+    // The first call runs and saves; the second replays the saved result.
+    for call in ["run", "replay"] {
+        let output = run_to(
+            &s,
+            &["--ttl", "1h"],
+            &steps,
+            None,
+            Some(common::closed_pipe()),
+        );
+        assert_eq!(code(&output), Some(0), "{call}");
+        assert_eq!(output.stdout.len(), 4194304, "{call}");
+        assert_eq!(s.count(), "x", "{call}");
+    }
+}
+
+#[test]
+fn closed_output_keeps_the_exit_of_a_command_killed_by_a_signal() {
+    let s = Sandbox::new();
+    let steps = ["count", "out:output", "raise:TERM"];
+    for expected in ["x", "xx"] {
+        let output = run_to(
+            &s,
+            &["--ttl", "1h", "--verbose"],
+            &steps,
+            Some(common::closed_pipe()),
+            None,
+        );
+        assert_eq!(code(&output), Some(128 + libc::SIGTERM));
+        assert!(
+            stderr(&output)
+                .contains("cacheexec: verbose: interrupted exit=143 saved=no reason=interrupted\n"),
+            "{}",
+            stderr(&output)
+        );
+        assert!(
+            !stderr(&output).contains("cacheexec: child"),
+            "{}",
+            stderr(&output)
+        );
+        // Signal terminations are never saved, so the command runs again.
+        assert_eq!(s.count(), expected);
+    }
+}
+
+#[test]
+fn closed_output_does_not_hide_other_stream_failures() {
+    let s = Sandbox::new();
+    let steps = ["count", "out:output", "err:warning"];
+    assert_eq!(code(&s.run(&["--ttl", "1h"], &steps)), Some(0));
+    for refresh in [true, false] {
+        for closed_stdout in [true, false] {
+            let case = format!("refresh={refresh} closed_stdout={closed_stdout}");
+            let full = common::FullPipe::new();
+            let (stdout, stderr) = if closed_stdout {
+                (common::closed_pipe(), full.nonblocking())
+            } else {
+                (full.nonblocking(), common::closed_pipe())
+            };
+            let options: &[&str] = if refresh {
+                &["--ttl", "1h", "--refresh"]
+            } else {
+                &["--ttl", "1h"]
+            };
+            let output = run_to(&s, options, &steps, Some(stdout), Some(stderr));
+            assert_eq!(code(&output), Some(125), "{case}");
+        }
+    }
+    assert_eq!(s.count(), "xxx");
 }
 
 #[test]
@@ -566,6 +688,55 @@ fn clear_removes_lock_files_of_idle_keys_only() {
     assert_eq!(kinds(), ["lock"]);
     clear(&["--older-than", "24h"]);
     assert!(kinds().is_empty());
+}
+
+#[test]
+fn clear_summary_to_a_closed_reader_still_succeeds() {
+    let s = Sandbox::new();
+    let clear = |stdout: std::os::fd::OwnedFd| {
+        let mut command = s.command();
+        command.arg("--clear").stdout(stdout);
+        s.spawn("clear", command).finish()
+    };
+    s.run(&["--ttl", "1h"], &["exit:0"]);
+    let output = clear(common::closed_pipe());
+    assert_eq!(code(&output), Some(0));
+    assert_eq!(stderr(&output), "");
+    assert!(s.cache_files("result").is_empty());
+    s.run(&["--ttl", "1h"], &["exit:0"]);
+    let full = common::FullPipe::new();
+    let output = clear(full.nonblocking());
+    assert_eq!(code(&output), Some(125));
+    // The deletion already happened, so the counts must survive the failure.
+    assert!(
+        stderr(&output)
+            .contains("print cleanup summary (removed=1 abandoned=0 skipped=0 failed=0)"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn clear_of_a_missing_directory_handles_summary_output_failures() {
+    let s = Sandbox::new();
+    let clear = |stdout: std::os::fd::OwnedFd| {
+        let mut command = s.command();
+        command.arg("--clear").stdout(stdout);
+        s.spawn("clear", command).finish()
+    };
+    let output = clear(common::closed_pipe());
+    assert_eq!(code(&output), Some(0));
+    assert_eq!(stderr(&output), "");
+    let full = common::FullPipe::new();
+    let output = clear(full.nonblocking());
+    assert_eq!(code(&output), Some(125));
+    assert!(
+        stderr(&output)
+            .contains("print cleanup summary (removed=0 abandoned=0 skipped=0 failed=0)"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!s.cache().exists());
 }
 
 #[test]

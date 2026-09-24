@@ -759,6 +759,13 @@ impl FullPipe {
         }
     }
 
+    /// A write end whose writes fail with EAGAIN, a failure other than a
+    /// closed reader.
+    pub fn nonblocking(&self) -> OwnedFd {
+        set_nonblocking(&self.writer, true);
+        self.writer.try_clone().unwrap()
+    }
+
     /// A write end whose writes block forever. The flag belongs to the open
     /// pipe, so this switches every end handed out by this `FullPipe`.
     pub fn blocking(&self) -> OwnedFd {

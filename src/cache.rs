@@ -52,13 +52,18 @@ impl Record {
         }
     }
     fn replay_bytes(&self) -> Result<()> {
-        let mut out = std::io::stdout().lock();
-        let mut err = std::io::stderr().lock();
-        out.write_all(&self.stdout).context("replay stdout")?;
-        out.flush().context("flush stdout")?;
-        err.write_all(&self.stderr).context("replay stderr")?;
-        err.flush().context("flush stderr")?;
-        Ok(())
+        // Like live delivery, a failure on one stream does not stop the other.
+        let out = (|| {
+            let mut out = std::io::stdout().lock();
+            out.write_all(&self.stdout).context("replay stdout")?;
+            out.flush().context("flush stdout")
+        })();
+        let err = (|| {
+            let mut err = std::io::stderr().lock();
+            err.write_all(&self.stderr).context("replay stderr")?;
+            err.flush().context("flush stderr")
+        })();
+        crate::runner::delivery_result(out, err)
     }
 }
 

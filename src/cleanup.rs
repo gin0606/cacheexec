@@ -1,8 +1,9 @@
-use crate::{cache, sharing};
+use crate::{cache, runner, sharing};
 use anyhow::{Context, Result, bail};
 use std::{
     collections::BTreeSet,
     fs::{self, OpenOptions},
+    io::Write,
     path::Path,
     time::{Duration, SystemTime},
 };
@@ -22,7 +23,7 @@ pub fn run(directory: &Path, age: Option<Duration>) -> Result<i32> {
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            println!("removed=0 abandoned=0 skipped=0 failed=0");
+            print_summary("removed=0 abandoned=0 skipped=0 failed=0")?;
             return Ok(0);
         }
         Err(error) => return Err(error).context("scan cache directory"),
@@ -109,8 +110,20 @@ pub fn run(directory: &Path, age: Option<Duration>) -> Result<i32> {
             errors.join("; ")
         );
     }
-    println!("{summary}");
+    print_summary(&summary)?;
     Ok(0)
+}
+
+/// A reader that closed early (e.g. `| head`) chose to stop reading, and the
+/// deletions are already done, so only other write failures are errors. Those
+/// still carry the counts, which would otherwise be lost.
+fn print_summary(summary: &str) -> Result<()> {
+    match writeln!(std::io::stdout(), "{summary}") {
+        Err(error) if !runner::reader_closed(&error) => {
+            Err(error).with_context(|| format!("print cleanup summary ({summary})"))
+        }
+        _ => Ok(()),
+    }
 }
 
 #[cfg(test)]
