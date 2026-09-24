@@ -97,8 +97,7 @@ pub fn run(
     if !try_lock(&active, true)? {
         bail!("new execution unexpectedly locked");
     }
-    active.write_all(&shared::pending())?;
-    vote(&mut active, request)?;
+    active.write_all(&shared::pending(request))?;
     unlock(&gate)?;
     diagnostic.decision(Decision::Run(reason), age, request.ttl, directory, key);
     own(

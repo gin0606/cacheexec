@@ -5,7 +5,8 @@
 //! completed execution is its [`Saving`] status.
 
 use crate::domain::{
-    execution::{CODES, Saving},
+    execution::{CODES, Saving, add_vote},
+    policy::Request,
     record::{self, Record},
 };
 use anyhow::{Context, Result};
@@ -30,9 +31,11 @@ pub enum Published {
     Unfinished,
 }
 
-/// A new execution's file: no votes yet, and nothing published.
-pub fn pending() -> Vec<u8> {
-    let mut bytes = vec![0; CODES];
+/// A new execution's file: only its owner's votes, and nothing published.
+pub fn pending(owner: &Request) -> Vec<u8> {
+    let mut votes = [0; CODES];
+    add_vote(&mut votes, owner);
+    let mut bytes = votes.to_vec();
     bytes.push(PENDING);
     bytes
 }
@@ -83,9 +86,17 @@ mod tests {
     use std::time::UNIX_EPOCH;
 
     #[test]
-    fn a_new_execution_is_pending_after_its_votes() {
-        let bytes = pending();
+    fn a_new_execution_is_pending_after_its_owner_votes() {
+        let bytes = pending(&Request {
+            command: vec!["true".into()],
+            ttl: std::time::Duration::ZERO,
+            refresh: false,
+            include_codes: Some(vec![0, 7]),
+            exclude_codes: None,
+        });
         assert_eq!(bytes.len() as u64, DETAIL_OFFSET);
+        let voted: Vec<usize> = (0..CODES).filter(|&code| bytes[code] != 0).collect();
+        assert_eq!(voted, [0, 7]);
         assert!(matches!(
             parse(&bytes[TAG_OFFSET as usize..]).unwrap(),
             Published::Unfinished
