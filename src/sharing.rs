@@ -312,18 +312,7 @@ fn own(
             Ok(()) => format!("{error:#}"),
             Err(cleanup) => format!("{error:#}; could not invalidate result: {cleanup:#}"),
         };
-        // An error is useful even if storage cannot be synchronized. A failed
-        // error write leaves the pending tag, never a successful result.
-        active.seek(SeekFrom::Start(DETAIL_OFFSET))?;
-        active.set_len(DETAIL_OFFSET)?;
-        active.write_all(&[u8::from(invalidated)])?;
-        active
-            .write_all(message.as_bytes())
-            .with_context(|| message.clone())?;
-        active.seek(SeekFrom::Start(TAG_OFFSET))?;
-        active
-            .write_all(&[FAILED])
-            .with_context(|| message.clone())?;
+        publish_failure(&mut active, invalidated, &message)?;
         let _ = fs::remove_file(active_path);
     }
     unlock(&active)?;
@@ -404,6 +393,21 @@ fn classify(
             kind
         },
     ))
+}
+
+/// Publishes a failed execution to waiters. An error is useful even if storage
+/// cannot be synchronized. If publishing fails, the original failure is kept
+/// in the error, and the tag stays pending, never a successful result.
+fn publish_failure(active: &mut File, invalidated: bool, message: &str) -> Result<()> {
+    (|| -> std::io::Result<()> {
+        active.seek(SeekFrom::Start(DETAIL_OFFSET))?;
+        active.set_len(DETAIL_OFFSET)?;
+        active.write_all(&[u8::from(invalidated)])?;
+        active.write_all(message.as_bytes())?;
+        active.seek(SeekFrom::Start(TAG_OFFSET))?;
+        active.write_all(&[FAILED])
+    })()
+    .with_context(|| message.to_owned())
 }
 
 fn stage(active: &mut File, execution: &runner::Execution, votes: &[u8; 256]) -> Result<()> {
@@ -555,6 +559,26 @@ mod tests {
             format!("{error:#}").contains("kept being removed"),
             "{error:#}"
         );
+    }
+
+    #[test]
+    fn a_failure_that_cannot_be_published_keeps_its_message() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("key.active");
+        let mut active = create(&path);
+        active.write_all(&[0; DETAIL_OFFSET as usize]).unwrap();
+        // Every write fails, including the first one.
+        let mut read_only = File::open(&path).unwrap();
+        let message = "child already completed with exit code 7; could not save result";
+        let error = publish_failure(&mut read_only, true, message).unwrap_err();
+        assert!(format!("{error:#}").starts_with(message), "{error:#}");
+        assert_eq!(fs::read(&path).unwrap(), [0; DETAIL_OFFSET as usize]);
+
+        publish_failure(&mut active, true, message).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes[TAG_OFFSET as usize], FAILED);
+        assert_eq!(bytes[DETAIL_OFFSET as usize], 1);
+        assert_eq!(&bytes[DETAIL_OFFSET as usize + 1..], message.as_bytes());
     }
 
     #[test]
