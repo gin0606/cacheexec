@@ -340,8 +340,7 @@ fn stage(active: &mut File, execution: &runner::Execution, votes: &[u8; 256]) ->
     active.write_all(&[Saving::of(execution, votes) as u8])?;
     active
         .write_all(&cache::encode(&execution.record)?)
-        .context("write shared result")?;
-    active.sync_all().context("sync shared result")
+        .context("write shared result")
 }
 
 fn apply_interrupt(execution: &mut runner::Execution, path: &Path) -> Result<bool> {
