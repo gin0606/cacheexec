@@ -155,7 +155,8 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 ```
 
-`nix flake check`でNix packageをビルド・テストできます。リリースには
+`nix flake check`でNix packageをビルド・テストできます。すべての依存関係を
+再ビルドするため`just check`には含めず、CIと`just release`で実行します。リリースには
 `Cargo.toml`のversionを使い、同じversionの`vX.Y.Z`タグをpushすると各platformの
 archiveを公開して`gin0606/homebrew-tap`を更新します。commit済みで変更のない
 `main` branchでは、`just release`がrepositoryを検証して対応するタグをpushします。

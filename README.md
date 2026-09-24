@@ -155,7 +155,8 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 ```
 
-`nix flake check` builds and tests the Nix package. Releases use the version in
+`nix flake check` builds and tests the Nix package. It rebuilds every dependency,
+so `just check` leaves it to CI and `just release`. Releases use the version in
 `Cargo.toml`; pushing the matching `vX.Y.Z` tag publishes the platform archives
 and updates `gin0606/homebrew-tap`. From a clean, committed `main` branch,
 `just release` validates the repository and pushes that tag.

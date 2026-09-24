@@ -46,6 +46,8 @@ if [ "$remote_tag_status" -ne 2 ]; then
 fi
 
 ./scripts/check
+# Left out of the everyday check because it rebuilds every dependency.
+nix flake check path:. --print-build-logs
 
 if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
   if [ "$(git rev-list -n 1 "$tag")" != "$(git rev-parse HEAD)" ]; then
