@@ -1163,34 +1163,106 @@ fn verbose_file_size_write_failure_does_not_deliver_sigxfsz() {
 
 #[test]
 fn owner_delivery_failure_does_not_fail_waiters_or_discard_cache() {
-    let steps = ["count", "event:started", "wait:go", "out:out", "err:err"];
-    for stderr in [false, true] {
-        let case = if stderr {
-            "closed stderr"
-        } else {
-            "closed stdout"
-        };
+    // A failing command, so a closed reader visibly keeps its status.
+    let steps = [
+        "count",
+        "event:started",
+        "wait:go",
+        "out:out",
+        "err:err",
+        "exit:3",
+    ];
+    for case in ["closed stdout", "closed stderr", "full stdout"] {
         let s = Sandbox::new();
         let mut go = s.gate("go");
-        let mut command = s.cacheexec(&["--ttl", "1h", "--include-codes", "0"], &steps);
-        if stderr {
-            command.stderr(common::closed_pipe());
-        } else {
-            command.stdout(common::closed_pipe());
-        }
+        let full = common::FullPipe::new();
+        let mut command = s.cacheexec(&["--ttl", "1h", "--include-codes", "3"], &steps);
+        let expected = match case {
+            "closed stdout" => {
+                command.stdout(common::closed_pipe());
+                3
+            }
+            "closed stderr" => {
+                command.stderr(common::closed_pipe());
+                3
+            }
+            _ => {
+                command.stdout(full.nonblocking());
+                125
+            }
+        };
         let leader = s.spawn("owner", command);
         s.wait_event("started");
         let joined = waiter(&s, "waiter", &["--include-codes", "1"], &steps, 1);
         go.release();
-        assert_eq!(code(&leader.finish()), Some(125), "owner: {case}");
+        let leader = leader.finish();
+        assert_eq!(code(&leader), Some(expected), "owner: {case}");
+        // The stream that is still open receives everything.
+        match case {
+            "closed stdout" => assert_eq!(leader.stderr, b"err", "{case}"),
+            "closed stderr" => assert_eq!(leader.stdout, b"out", "{case}"),
+            _ => {}
+        }
         for (name, output) in [
             ("waiter", joined.finish()),
             ("hit", s.run(&["--ttl", "1h"], &steps)),
         ] {
-            assert_eq!(code(&output), Some(0), "{name}: {case}");
+            assert_eq!(code(&output), Some(3), "{name}: {case}");
             assert_eq!(output.stdout, b"out", "{name}: {case}");
             assert_eq!(child_stderr(&output.stderr), b"err", "{name}: {case}");
         }
         assert_eq!(s.count(), "x", "{case}");
     }
+}
+
+#[test]
+fn waiter_with_closed_output_exits_with_the_command_status_and_shared_saving() {
+    // A failing command, so the waiter visibly keeps the shared status.
+    let steps = [
+        "count",
+        "event:started",
+        "wait:go",
+        "out:out",
+        "err:err",
+        "exit:3",
+    ];
+    for (owner_codes, saving) in [
+        ("3", "saved=yes"),
+        ("1", "saved=no reason=participant-policy"),
+    ] {
+        let s = Sandbox::new();
+        let mut go = s.gate("go");
+        let leader = owner(&s, &["--include-codes", owner_codes], &steps);
+        let mut command = s.cacheexec(&with_ttl(&["--include-codes", "2", "--verbose"]), &steps);
+        command.stdout(common::closed_pipe());
+        let joined = quiet_join(&s, "waiter", command, 2);
+        go.release();
+        let leader = leader.finish();
+        assert_eq!(code(&leader), Some(3), "owner: {saving}");
+        assert_eq!(leader.stdout, b"out", "owner: {saving}");
+        let joined = joined.finish();
+        assert_eq!(code(&joined), Some(3), "waiter: {saving}");
+        assert_eq!(child_stderr(&joined.stderr), b"err", "waiter: {saving}");
+        assert_eq!(
+            verbose_lines(&joined.stderr).last().map(String::as_str),
+            Some(format!("output-closed exit=3 {saving}").as_str()),
+            "{}",
+            text(&joined.stderr)
+        );
+        assert_eq!(s.count(), "x", "{saving}");
+    }
+}
+
+#[test]
+fn waiter_with_closed_output_still_reports_owner_interruption() {
+    let steps = ["count", "out:out", "event:started", "wait:go"];
+    let s = Sandbox::new();
+    let _go = s.gate("go");
+    let leader = owner(&s, &["--include-codes", "0"], &steps);
+    let mut command = s.cacheexec(&with_ttl(&["--include-codes", "1"]), &steps);
+    command.stdout(common::closed_pipe());
+    let joined = quiet_join(&s, "waiter", command, 1);
+    leader.signal(libc::SIGINT);
+    assert_eq!(code(&leader.finish()), Some(128 + libc::SIGINT));
+    assert_eq!(code(&joined.finish()), Some(128 + libc::SIGINT));
 }

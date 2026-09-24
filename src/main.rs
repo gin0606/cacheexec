@@ -38,6 +38,8 @@ Exit codes:
   125          Tool error, with a cacheexec: diagnostic
   2            Invalid arguments
   Child codes can also be 2 or 125; distinguish tool errors by diagnostics.
+  A closed output reader (e.g. | head) keeps the child's code, with no
+  diagnostic.
 
 Storage and cleanup:
   $XDG_CACHE_HOME/cacheexec or $HOME/.cache/cacheexec; override with --cache-dir.
