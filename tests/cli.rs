@@ -542,6 +542,33 @@ fn clear_all_age_directory_isolation_and_condition_fixture() {
 }
 
 #[test]
+fn clear_removes_lock_files_of_idle_keys_only() {
+    let s = Sandbox::new();
+    let kinds = || {
+        let mut kinds: Vec<_> = ["lock", "result", "active"]
+            .into_iter()
+            .filter(|kind| !s.cache_files(kind).is_empty())
+            .collect();
+        kinds.sort_unstable();
+        kinds
+    };
+    let clear = |options: &[&str]| {
+        let output = s.clear(options);
+        assert_eq!(code(&output), Some(0), "{}", stderr(&output));
+    };
+    s.run(&["--ttl", "1h"], &["exit:0"]);
+    clear(&["--older-than", "24h"]);
+    assert_eq!(kinds(), ["lock", "result"]);
+    clear(&[]);
+    assert!(kinds().is_empty());
+    // A gate left without a result, as after an uncached exit code.
+    s.run(&["--ttl", "1h", "--exclude-codes", "0"], &["exit:0"]);
+    assert_eq!(kinds(), ["lock"]);
+    clear(&["--older-than", "24h"]);
+    assert!(kinds().is_empty());
+}
+
+#[test]
 fn clear_blocked_on_its_summary_stays_killable() {
     use std::os::unix::process::ExitStatusExt;
     let s = Sandbox::new();
