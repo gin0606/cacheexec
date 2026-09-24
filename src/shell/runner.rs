@@ -3,10 +3,11 @@ use crate::{
         delivery::delivery_result,
         execution::{Outcome, signal_code},
     },
-    shell::signals,
+    shell::signals::{self, Waited},
 };
 use anyhow::{Context, Result, anyhow};
 use std::{
+    convert::Infallible,
     ffi::OsString,
     io::{Read, Write},
     os::unix::process::{CommandExt, ExitStatusExt},
@@ -18,7 +19,7 @@ use std::{
 
 pub struct Execution {
     pub outcome: Outcome,
-    pub delivery: Delivery,
+    pub forwarding: Forwarding,
 }
 
 fn capture(mut input: impl Read, output: mpsc::Sender<Vec<u8>>) -> Result<Vec<u8>> {
@@ -58,8 +59,20 @@ pub fn execute(argv: &[OsString]) -> Result<Execution> {
     let stderr = child.stderr.take().context("missing child stderr pipe")?;
     let (out_sender, out_receiver) = mpsc::channel();
     let (err_sender, err_receiver) = mpsc::channel();
-    let out_writer = thread::spawn(move || stream(out_receiver, std::io::stdout().lock()));
-    let err_writer = thread::spawn(move || stream(err_receiver, std::io::stderr().lock()));
+    // Each writer holds a sender until it ends, so the channel closes once
+    // both have finished, even by panicking.
+    let (finished, finishing) = mpsc::channel();
+    let out_writer = thread::spawn({
+        let finished = finished.clone();
+        move || {
+            let _finished = finished;
+            stream(out_receiver, std::io::stdout().lock())
+        }
+    });
+    let err_writer = thread::spawn(move || {
+        let _finished = finished;
+        stream(err_receiver, std::io::stderr().lock())
+    });
     let (status, completed, out, err) = thread::scope(|scope| {
         let out = scope.spawn(move || capture(stdout, out_sender));
         let err = scope.spawn(move || capture(stderr, err_sender));
@@ -112,22 +125,28 @@ pub fn execute(argv: &[OsString]) -> Result<Execution> {
     );
     Ok(Execution {
         outcome,
-        delivery: Delivery([out_writer, err_writer]),
+        forwarding: Forwarding {
+            writers: [out_writer, err_writer],
+            finished: finishing,
+        },
     })
 }
 
-pub struct Delivery([thread::JoinHandle<Result<()>>; 2]);
+/// The writers that forward the child's output to this process's streams.
+pub struct Forwarding {
+    writers: [thread::JoinHandle<Result<()>>; 2],
+    /// Never receives; it closes when both writers have ended.
+    finished: mpsc::Receiver<Infallible>,
+}
 
-impl Delivery {
+impl Forwarding {
     pub fn finish(self, code: i32) -> Result<i32> {
-        while signals::received() == 0 && !self.0.iter().all(|writer| writer.is_finished()) {
-            thread::sleep(Duration::from_millis(10));
+        match signals::wait(&self.finished) {
+            Waited::Done(never) => match never {},
+            Waited::Interrupted(signal) => return Ok(signal_code(signal)),
+            Waited::Closed => {}
         }
-        let signal = signals::received();
-        if signal != 0 {
-            return Ok(signal_code(signal));
-        }
-        let [out, err] = self.0.map(|writer| {
+        let [out, err] = self.writers.map(|writer| {
             writer
                 .join()
                 .map_err(|_| anyhow!("output writer panicked"))

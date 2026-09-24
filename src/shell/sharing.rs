@@ -80,7 +80,7 @@ pub fn run(
     let Some(reason) = request.reason(previous.as_ref(), now) else {
         unlock(&gate)?;
         diagnostic.decision(Decision::Hit, age, request.ttl, directory, key);
-        return replay(
+        return replay_and_report(
             previous.expect("hit requires a result"),
             Saved::Reused,
             diagnostic,
@@ -120,7 +120,7 @@ fn join(mut active: File, diagnostic: &Verbose) -> Result<i32> {
     unlock(&active)?;
     match shared::parse(&bytes)? {
         Published::Completed { saving, record } => {
-            replay(record, Saved::Execution(saving), diagnostic)
+            replay_and_report(record, Saved::Execution(saving), diagnostic)
         }
         Published::Failed {
             invalidated,
@@ -177,7 +177,7 @@ fn own(
             .write_all(&[COMPLETED])
             .context("commit shared result")?;
         let saving = Saving::of(child, &votes);
-        Ok((child.code(), saving, execution.delivery))
+        Ok((child.code(), saving, execution.forwarding))
     });
     let outcome = match child_context {
         Some(context) => outcome.context(context),
@@ -196,9 +196,9 @@ fn own(
     }
     unlock(&active)?;
     unlock(gate)?;
-    let (code, saving, delivery) = outcome?;
+    let (code, saving, forwarding) = outcome?;
     report(
-        delivery.finish(code),
+        forwarding.finish(code),
         code,
         Saved::Execution(saving),
         Failure::Delivery,
@@ -206,7 +206,7 @@ fn own(
     )
 }
 
-fn replay(record: Record, saved: Saved, diagnostic: &Verbose) -> Result<i32> {
+fn replay_and_report(record: Record, saved: Saved, diagnostic: &Verbose) -> Result<i32> {
     let code = record.code;
     report(
         replay::write(record),

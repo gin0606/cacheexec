@@ -1,13 +1,9 @@
 use crate::{
     domain::{delivery::delivery_result, execution::signal_code, record::Record},
-    shell::signals,
+    shell::signals::{self, Waited},
 };
 use anyhow::{Context, Result, bail};
-use std::{
-    io::Write,
-    sync::mpsc::{self, RecvTimeoutError},
-    time::Duration,
-};
+use std::{io::Write, sync::mpsc};
 
 pub fn write(record: Record) -> Result<i32> {
     let code = record.code;
@@ -15,25 +11,10 @@ pub fn write(record: Record) -> Result<i32> {
     std::thread::spawn(move || {
         let _ = completed.send(replay_bytes(&record));
     });
-    loop {
-        if signals::received() != 0 {
-            // main exits immediately after this return; a blocked writer must not
-            // prevent cancellation or keep the process alive.
-            return Ok(signal_code(signals::received()));
-        }
-        // Completion wakes immediately; the timeout only bounds signal latency
-        // while an output consumer has stopped reading.
-        match completion.recv_timeout(Duration::from_millis(10)) {
-            Ok(result) => {
-                if signals::received() != 0 {
-                    return Ok(signal_code(signals::received()));
-                }
-                result?;
-                return Ok(code);
-            }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => bail!("replay worker panicked"),
-        }
+    match signals::wait(&completion) {
+        Waited::Done(result) => result.map(|()| code),
+        Waited::Interrupted(signal) => Ok(signal_code(signal)),
+        Waited::Closed => bail!("replay worker panicked"),
     }
 }
 
