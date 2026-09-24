@@ -90,7 +90,7 @@ jobs:
           sudo apt-get install --yes musl-tools
 
       - name: Build the binary
-        run: cargo build --locked --release --target "${{ matrix.target }}"
+        run: cargo build --locked --release --bin cacheexec --target "${{ matrix.target }}"
 
       - name: Package the binary
         env:

@@ -8,6 +8,15 @@ license = "MIT"
 repository = "https://github.com/gin0606/cacheexec"
 readme = "README.md"
 publish = false
+default-run = "cacheexec"
+
+# The child command for the integration tests, found through
+# CARGO_BIN_EXE_cacheexec-test-child. Install only `cacheexec`.
+[[bin]]
+name = "cacheexec-test-child"
+path = "tests/bin/cacheexec-test-child.rs"
+test = false
+doc = false
 
 [dependencies]
 anyhow = "1"

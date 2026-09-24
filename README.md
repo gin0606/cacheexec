@@ -23,10 +23,10 @@ nix profile install github:gin0606/cacheexec
 Or build the tagged source with Cargo:
 
 ```sh
-cargo install --git https://github.com/gin0606/cacheexec --locked
+cargo install --git https://github.com/gin0606/cacheexec --locked --bin cacheexec
 ```
 
-For development, install from a local checkout with `cargo install --path . --locked`.
+For development, install from a local checkout with `cargo install --path . --locked --bin cacheexec`.
 
 ## Quick start
 
