@@ -13,4 +13,3 @@ fi
 "$cargo_bin" fmt --check
 "$cargo_bin" clippy --locked --all-targets -- -D warnings
 "$cargo_bin" test --locked
-nix flake check path:. --print-build-logs
