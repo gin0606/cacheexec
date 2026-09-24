@@ -2,7 +2,7 @@ use crate::{
     domain::{
         cleanup::{Disposal, disposal, summary_line},
         delivery,
-        location::key_of_entry,
+        location::{Entry, entry_name, key_of_entry},
     },
     shell::{lock, store},
 };
@@ -49,12 +49,12 @@ pub fn run(directory: &Path, age: Option<Duration>) -> Result<i32> {
     let (mut removed, mut abandoned, mut skipped) = (0, 0, 0);
     for key in keys {
         let outcome = (|| -> Result<()> {
-            let gate_path = directory.join(format!("{key}.lock"));
+            let gate_path = directory.join(entry_name(&key, Entry::Lock));
             let Some(_gate) = lock::acquire_gate(&gate_path, false)? else {
                 skipped += 1;
                 return Ok(());
             };
-            let active_path = directory.join(format!("{key}.active"));
+            let active_path = directory.join(entry_name(&key, Entry::Active));
             let active = match OpenOptions::new().read(true).write(true).open(&active_path) {
                 Ok(active) => Some(active),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -70,7 +70,7 @@ pub fn run(directory: &Path, age: Option<Duration>) -> Result<i32> {
                 fs::remove_file(&active_path).context("remove abandoned execution")?;
                 abandoned += 1;
             }
-            let result_path = directory.join(format!("{key}.result"));
+            let result_path = directory.join(entry_name(&key, Entry::Result));
             let completed = match store::read(&result_path)? {
                 Some(store::Stored::Current(record)) => Some(record.completed),
                 // Results are written right after completion, so the

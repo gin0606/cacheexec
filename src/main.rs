@@ -97,9 +97,8 @@ fn run(cli: Cli, diagnostic: &verbose::Verbose) -> Result<i32> {
     };
     let cwd = std::env::current_dir().context("read working directory")?;
     let key = key::key(&request.command, &cwd, cli.key.as_deref());
-    let path = directory.join(format!("{key}.result"));
     std::fs::create_dir_all(&directory).context("create cache directory")?;
-    sharing::run(&request, &directory, &key, &path, diagnostic)
+    sharing::run(&request, &directory, &key, diagnostic)
 }
 
 fn default_cache_dir() -> Result<PathBuf> {

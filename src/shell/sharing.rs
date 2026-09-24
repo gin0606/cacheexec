@@ -2,6 +2,7 @@ use crate::{
     domain::{
         delivery,
         execution::{self, CODES, Outcome, Saving, Votes, signal_code},
+        location::{Entry, entry_name},
         message::{self, Decision, Failure, Saved, Wait},
         policy::Request,
         record::Record,
@@ -47,17 +48,12 @@ fn interrupted(diagnostic: &Verbose, wait: Wait) -> i32 {
 // holding `.active` blocks on the gate, so the two locks cannot deadlock. The
 // owner may relock its gate descriptor after execution because cleanup never
 // unlinks `.lock` while `.active` is locked.
-pub fn run(
-    request: &Request,
-    directory: &Path,
-    key: &str,
-    result_path: &Path,
-    diagnostic: &Verbose,
-) -> Result<i32> {
-    let Some(gate) = acquire_gate(&directory.join(format!("{key}.lock")), true)? else {
+pub fn run(request: &Request, directory: &Path, key: &str, diagnostic: &Verbose) -> Result<i32> {
+    let result_path = &directory.join(entry_name(key, Entry::Result));
+    let Some(gate) = acquire_gate(&directory.join(entry_name(key, Entry::Lock)), true)? else {
         return Ok(interrupted(diagnostic, Wait::Key));
     };
-    let active_path = directory.join(format!("{key}.active"));
+    let active_path = directory.join(entry_name(key, Entry::Active));
     match OpenOptions::new().read(true).write(true).open(&active_path) {
         Ok(mut active) => {
             if !try_lock(&active, true)? {
