@@ -4,7 +4,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     os::fd::AsRawFd,
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::Path,
     thread,
     time::{Duration, SystemTime},
@@ -35,6 +35,46 @@ fn lock(file: &File, interruptible: bool) -> Result<bool> {
         }
         thread::sleep(Duration::from_millis(10));
     }
+}
+/// Opens and locks a key's gate. Cleanup may unlink an idle `.lock` while
+/// holding it, so a lock only counts while the locked inode is still linked;
+/// otherwise a caller that opened the removed inode retries with a new one.
+/// The link count comes from the descriptor alone, because some filesystems
+/// report different identities for `fstat` and `stat` of the same file.
+/// Returns `None` when interrupted, or when busy without `wait`.
+pub fn acquire_gate(path: &Path, wait: bool) -> Result<Option<File>> {
+    acquire_gate_with(path, wait, || {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+    })
+}
+
+fn acquire_gate_with(
+    path: &Path,
+    wait: bool,
+    mut open: impl FnMut() -> std::io::Result<File>,
+) -> Result<Option<File>> {
+    // Each retry needs a concurrent cleanup, so a bound only guards against a
+    // filesystem that never reports a link, which must fail instead of spinning.
+    for _ in 0..100 {
+        let gate = open().context("open key lock")?;
+        let locked = if wait {
+            lock(&gate, true)?
+        } else {
+            try_lock(&gate, true)?
+        };
+        if !locked {
+            return Ok(None);
+        }
+        if gate.metadata().context("inspect key lock")?.nlink() > 0 {
+            return Ok(Some(gate));
+        }
+    }
+    bail!("key lock {path:?} kept being removed while being locked")
 }
 fn unlock(file: &File) -> Result<()> {
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } != 0 {
@@ -106,7 +146,9 @@ fn interrupted(diagnostic: &Verbose, reason: &str) -> i32 {
 }
 
 // Lock order: a caller holding the gate only try-locks `.active`, and the owner
-// holding `.active` blocks on the gate, so the two locks cannot deadlock.
+// holding `.active` blocks on the gate, so the two locks cannot deadlock. The
+// owner may relock its gate descriptor after execution because cleanup never
+// unlinks `.lock` while `.active` is locked.
 pub fn run(
     request: &Request,
     directory: &Path,
@@ -114,16 +156,9 @@ pub fn run(
     result_path: &Path,
     diagnostic: &Verbose,
 ) -> Result<i32> {
-    let gate = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(directory.join(format!("{key}.lock")))
-        .context("open key lock")?;
-    if !lock(&gate, true)? {
+    let Some(gate) = acquire_gate(&directory.join(format!("{key}.lock")), true)? else {
         return Ok(interrupted(diagnostic, "interrupted"));
-    }
+    };
     let active_path = directory.join(format!("{key}.active"));
     match OpenOptions::new().read(true).write(true).open(&active_path) {
         Ok(mut active) => {
@@ -160,7 +195,8 @@ pub fn run(
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(&active_path)?;
+        .open(&active_path)
+        .with_context(|| format!("create active execution {active_path:?}"))?;
     if !try_lock(&active, true)? {
         bail!("new execution unexpectedly locked");
     }
@@ -357,4 +393,105 @@ fn apply_signal(execution: &mut runner::Execution, path: &Path, signal: i32) -> 
     execution.reusable = false;
     cache::invalidate(path)?;
     Ok(changed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    fn identity(file: &File) -> (u64, u64) {
+        let metadata = file.metadata().unwrap();
+        (metadata.dev(), metadata.ino())
+    }
+
+    fn create(path: &Path) -> File {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_gate_unlinked_while_waiting_is_replaced_by_the_current_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("key.lock");
+        // Cleanup unlinks the gate this caller opened, and a newer caller
+        // creates and holds the current one.
+        let current = create(&path);
+        let stale = directory.path().join("stale.lock");
+        let stale_file = create(&stale);
+        assert!(try_lock(&current, true).unwrap());
+        let current_identity = identity(&current);
+        let (reopened, reopening) = mpsc::channel();
+        let caller = thread::spawn({
+            let path = path.clone();
+            let mut opens = 0;
+            move || {
+                acquire_gate_with(&path, true, || {
+                    opens += 1;
+                    if opens == 1 {
+                        fs::remove_file(&stale)?;
+                        return stale_file.try_clone();
+                    }
+                    reopened.send(()).unwrap();
+                    OpenOptions::new().read(true).write(true).open(&path)
+                })
+            }
+        });
+        reopening.recv().unwrap();
+        // The caller now waits on the current gate, which is still held.
+        assert!(!caller.is_finished());
+        unlock(&current).unwrap();
+        let gate = caller.join().unwrap().unwrap().unwrap();
+        assert_eq!(identity(&gate), current_identity);
+    }
+
+    #[test]
+    fn a_gate_unlinked_without_replacement_is_recreated() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("key.lock");
+        let removed = create(&path);
+        let removed_identity = identity(&removed);
+        fs::remove_file(&path).unwrap();
+        let mut opens = 0;
+        let gate = acquire_gate_with(&path, false, || {
+            opens += 1;
+            if opens == 1 {
+                removed.try_clone()
+            } else {
+                Ok(create(&path))
+            }
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(opens, 2);
+        assert_ne!(identity(&gate), removed_identity);
+        assert_eq!(gate.metadata().unwrap().nlink(), 1);
+    }
+
+    #[test]
+    fn a_gate_that_is_never_linked_is_an_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("key.lock");
+        let removed = create(&path);
+        fs::remove_file(&path).unwrap();
+        let error = acquire_gate_with(&path, false, || removed.try_clone()).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("kept being removed"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn a_busy_gate_is_skipped_without_waiting() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("key.lock");
+        let held = create(&path);
+        assert!(try_lock(&held, true).unwrap());
+        assert!(acquire_gate(&path, false).unwrap().is_none());
+    }
 }

@@ -49,7 +49,7 @@ struct Cli {
     /// Maximum result age since completion (required, including for refresh)
     #[arg(long, value_parser = humantime::parse_duration, required_unless_present = "clear", conflicts_with = "clear")]
     ttl: Option<Duration>,
-    /// Delete idle results; retain busy keys and stable lock files
+    /// Delete idle results and lock files of keys left empty; skip busy keys
     #[arg(long, conflicts_with_all = ["command", "key", "refresh", "include_codes", "exclude_codes"])]
     clear: bool,
     /// With --clear, delete only results strictly older than this completion age

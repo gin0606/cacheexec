@@ -11,6 +11,13 @@ fn old_enough(completed: SystemTime, age: Option<Duration>, now: SystemTime) -> 
     age.is_none_or(|limit| now.duration_since(completed).is_ok_and(|age| age > limit))
 }
 
+/// Unlinks an idle key's `.lock` while its lock is held. Callers waiting on the
+/// old inode see that it has no links left once they lock it, and reopen the
+/// path (see `sharing::acquire_gate`); checking the path alone would be racy.
+fn remove_gate(path: &Path) -> Result<()> {
+    fs::remove_file(path).context("remove idle key lock")
+}
+
 pub fn run(directory: &Path, age: Option<Duration>) -> Result<i32> {
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
@@ -28,7 +35,7 @@ pub fn run(directory: &Path, age: Option<Duration>) -> Result<i32> {
                 let name = entry.file_name();
                 let Some(name) = name.to_str() else { continue };
                 if let Some((key, extension)) = name.rsplit_once('.') {
-                    if matches!(extension, "result" | "active")
+                    if matches!(extension, "result" | "active" | "lock")
                         && key.len() == 64
                         && key
                             .bytes()
@@ -45,19 +52,11 @@ pub fn run(directory: &Path, age: Option<Duration>) -> Result<i32> {
     let (mut removed, mut abandoned, mut skipped) = (0, 0, 0);
     for key in keys {
         let outcome = (|| -> Result<()> {
-            // Never unlink this inode: executions may already have it open while
-            // waiting for the gate, including calls that began after our scan.
-            let gate = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(directory.join(format!("{key}.lock")))
-                .context("open key lock")?;
-            if !sharing::try_lock(&gate, true)? {
+            let gate_path = directory.join(format!("{key}.lock"));
+            let Some(_gate) = sharing::acquire_gate(&gate_path, false)? else {
                 skipped += 1;
                 return Ok(());
-            }
+            };
             let active_path = directory.join(format!("{key}.active"));
             let active = match OpenOptions::new().read(true).write(true).open(&active_path) {
                 Ok(active) => Some(active),
@@ -86,9 +85,13 @@ pub fn run(directory: &Path, age: Option<Duration>) -> Result<i32> {
                 ),
                 None => None,
             };
-            if completed.is_some_and(|completed| old_enough(completed, age, now)) {
+            let Some(completed) = completed else {
+                return remove_gate(&gate_path);
+            };
+            if old_enough(completed, age, now) {
                 fs::remove_file(&result_path).context("delete cached result")?;
                 removed += 1;
+                return remove_gate(&gate_path);
             }
             Ok(())
         })();

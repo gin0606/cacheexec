@@ -675,16 +675,25 @@ fn cleanup_preserves_running_refresh_and_undelivered_waiter_generation() {
     let joined = verbose_waiter(&s, "waiter", &["--include-codes", "1"], &SCRIPT);
     // Keep the waiter from reading its generation.
     joined.signal(libc::SIGSTOP);
+    let gate = || {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(s.cache_file("lock")).unwrap().ino()
+    };
+    let busy_gate = gate();
     assert!(
         clear(&s).contains("skipped=1"),
         "cleanup took a running execution"
     );
+    // The owner relocks its gate after the child exits, so it must survive.
+    assert_eq!(gate(), busy_gate, "cleanup replaced a running key's gate");
     go.release();
     let first = leader.finish();
     assert!(clear(&s).contains("removed=1"));
+    // The key is idle, so its gate is gone; the stopped waiter still holds
+    // its generation.
     assert!(
-        s.cache_file("lock").exists(),
-        "cleanup removed the lock file"
+        s.cache_files("lock").is_empty(),
+        "cleanup kept an idle gate"
     );
     assert_eq!(code(&s.run(&["--ttl", "1h"], &SCRIPT)), Some(7));
     joined.signal(libc::SIGCONT);
@@ -694,6 +703,27 @@ fn cleanup_preserves_running_refresh_and_undelivered_waiter_generation() {
     assert_eq!(child_stderr(&replay.stderr), first.stderr);
     assert_eq!(code(&s.run(&["--ttl", "1h"], &SCRIPT)), Some(7));
     assert_eq!(s.count(), "xxx");
+}
+
+#[test]
+fn caller_waiting_on_a_removed_lock_file_recreates_it() {
+    let s = Sandbox::new();
+    let steps = ["count", "exit:0"];
+    assert_eq!(code(&s.run(&["--ttl", "1h"], &steps)), Some(0));
+    // Act as cleanup: hold the key's lock while a caller starts waiting on it,
+    // then remove the file and release it.
+    let held = Held::lock(&s);
+    let caller = s.spawn("caller", s.cacheexec(&["--ttl", "1h", "--refresh"], &steps));
+    // Give the caller time to open the lock file. If it has not, it only
+    // creates a new one, so the test cannot fail spuriously.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    fs::remove_file(s.cache_file("lock")).unwrap();
+    drop(held);
+    assert_eq!(code(&caller.finish()), Some(0));
+    // A caller that ran on the removed file would leave no lock file behind,
+    // and a later caller could then run beside it.
+    assert_eq!(s.cache_files("lock").len(), 1, "the removed lock was used");
+    assert_eq!(s.count(), "xx");
 }
 
 /// `cacheexec` for `steps`, started with `ignored` signals set to SIG_IGN.
