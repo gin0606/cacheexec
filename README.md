@@ -105,7 +105,7 @@ Use an additional key or refresh when an environment variable, executable or inp
 cacheexec --ttl 5m --key "$DEPLOY_ENV" -- ./query
 ```
 
-Storage is `$XDG_CACHE_HOME/cacheexec`, or `$HOME/.cache/cacheexec` when XDG is unset or empty, on both platforms. `--cache-dir PATH` overrides it. Storage uses local files; completed results are checksummed and atomically published. Each key has one latest result. Outputs are buffered in memory, so size them to available RAM. Network filesystem guarantees are out of scope.
+Storage is `$XDG_CACHE_HOME/cacheexec`, or `$HOME/.cache/cacheexec` when XDG is unset or empty, on both platforms. `--cache-dir PATH` overrides it. Storage uses local files; completed results are checksummed and atomically published. Each key has one latest result. Outputs are buffered in memory, so size them to available RAM. Network filesystem guarantees are out of scope. Use a cache directory that only you can write to: anyone who can write there can replace results that later calls replay.
 
 ## Exit codes and errors
 
