@@ -3,7 +3,8 @@ use crate::{
         delivery,
         execution::{self, CODES, Outcome, Saving, Votes, signal_code},
         policy::Request,
-        record::{self, Record},
+        record::Record,
+        shared::{self, COMPLETED, DETAIL_OFFSET, FAILED, Published, TAG_OFFSET},
     },
     shell::{
         lock::{acquire_gate, lock, try_lock, unlock},
@@ -19,14 +20,6 @@ use std::{
     path::Path,
     time::SystemTime,
 };
-
-// Layout of a `.active` file: one save-permission byte per exit code, then a
-// state tag, a detail byte, and the encoded record or failure message.
-const TAG_OFFSET: u64 = 256;
-const DETAIL_OFFSET: u64 = 257;
-const PENDING: u8 = 2;
-const COMPLETED: u8 = 3;
-const FAILED: u8 = 4;
 
 fn read_votes(file: &mut File) -> std::io::Result<Votes> {
     let mut votes = [0; CODES];
@@ -106,8 +99,7 @@ pub fn run(
     if !try_lock(&active, true)? {
         bail!("new execution unexpectedly locked");
     }
-    active.write_all(&[0; 256])?;
-    active.write_all(&[PENDING])?;
+    active.write_all(&shared::pending())?;
     vote(&mut active, request)?;
     unlock(&gate)?;
     diagnostic.decision(
@@ -135,30 +127,21 @@ fn join(mut active: File, diagnostic: &Verbose) -> Result<i32> {
     let mut bytes = Vec::new();
     active.read_to_end(&mut bytes)?;
     unlock(&active)?;
-    match bytes.split_first() {
-        Some((&COMPLETED, detail)) => {
-            let (saving, encoded) = detail
-                .split_first()
-                .context("missing shared saving status")?;
-            let saving = Saving::decode(*saving)?;
-            replay(
-                record::decode(encoded)?,
-                saving.describe(),
-                saving == Saving::Interrupted,
-                diagnostic,
-            )
+    match shared::parse(&bytes)? {
+        Published::Completed { saving, record } => replay(
+            record,
+            saving.describe(),
+            saving == Saving::Interrupted,
+            diagnostic,
+        ),
+        Published::Failed {
+            invalidated,
+            message,
+        } => {
+            diagnostic.failed(if invalidated { "no" } else { "unknown" });
+            bail!("shared execution failed: {message}");
         }
-        Some((&FAILED, detail)) => {
-            let (invalidated, message) = detail
-                .split_first()
-                .context("missing shared failure status")?;
-            diagnostic.failed(if *invalidated == 1 { "no" } else { "unknown" });
-            bail!(
-                "shared execution failed: {}",
-                String::from_utf8_lossy(message)
-            );
-        }
-        _ => bail!(
+        Published::Unfinished => bail!(
             "execution owner disappeared before publishing a complete result; command not retried"
         ),
     }
@@ -277,8 +260,7 @@ fn publish_failure(active: &mut File, invalidated: bool, message: &str) -> Resul
     (|| -> std::io::Result<()> {
         active.seek(SeekFrom::Start(DETAIL_OFFSET))?;
         active.set_len(DETAIL_OFFSET)?;
-        active.write_all(&[u8::from(invalidated)])?;
-        active.write_all(message.as_bytes())?;
+        active.write_all(&shared::failure_detail(invalidated, message))?;
         active.seek(SeekFrom::Start(TAG_OFFSET))?;
         active.write_all(&[FAILED])
     })()
@@ -286,12 +268,10 @@ fn publish_failure(active: &mut File, invalidated: bool, message: &str) -> Resul
 }
 
 fn stage(active: &mut File, outcome: &Outcome, votes: &Votes) -> Result<()> {
+    let detail = shared::completed_detail(Saving::of(outcome, votes), outcome.record())?;
     active.seek(SeekFrom::Start(DETAIL_OFFSET))?;
     active.set_len(DETAIL_OFFSET)?;
-    active.write_all(&[Saving::of(outcome, votes) as u8])?;
-    active
-        .write_all(&record::encode(outcome.record())?)
-        .context("write shared result")
+    active.write_all(&detail).context("write shared result")
 }
 
 fn apply_interrupt(outcome: &mut Outcome, path: &Path) -> Result<bool> {

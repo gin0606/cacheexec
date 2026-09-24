@@ -57,21 +57,25 @@ pub fn decode(bytes: &[u8]) -> Result<Record> {
 
 pub fn encode(record: &Record) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
+    encode_into(&mut bytes, record)?;
+    Ok(bytes)
+}
+
+/// Appends the encoded `record` to `bytes`, so a caller can put a prefix in
+/// front of a large record without copying it.
+pub fn encode_into(bytes: &mut Vec<u8>, record: &Record) -> Result<()> {
+    let completed = record.completed.duration_since(UNIX_EPOCH)?.as_nanos();
+    let start = bytes.len();
     bytes.extend(MAGIC);
-    bytes.extend(
-        record
-            .completed
-            .duration_since(UNIX_EPOCH)?
-            .as_nanos()
-            .to_le_bytes(),
-    );
+    bytes.extend(completed.to_le_bytes());
     bytes.extend(record.code.to_le_bytes());
     bytes.extend((record.stdout.len() as u64).to_le_bytes());
     bytes.extend((record.stderr.len() as u64).to_le_bytes());
     bytes.extend(&record.stdout);
     bytes.extend(&record.stderr);
-    bytes.extend_from_slice(&Sha256::digest(&bytes));
-    Ok(bytes)
+    let checksum = Sha256::digest(&bytes[start..]);
+    bytes.extend_from_slice(&checksum);
+    Ok(())
 }
 
 #[cfg(test)]

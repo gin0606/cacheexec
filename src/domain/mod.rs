@@ -8,3 +8,4 @@ pub mod execution;
 pub mod key;
 pub mod policy;
 pub mod record;
+pub mod shared;
