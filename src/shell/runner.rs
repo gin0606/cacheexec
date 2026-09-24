@@ -1,4 +1,7 @@
-use crate::cache::Record;
+use crate::{
+    domain::{delivery::delivery_result, record::Record},
+    shell::signals,
+};
 use anyhow::{Context, Result, anyhow};
 use std::{
     ffi::OsString,
@@ -61,7 +64,7 @@ pub fn execute(argv: &[OsString]) -> Result<Execution> {
         let err = scope.spawn(move || capture(stderr, err_sender));
         let mut completed = None;
         let status = loop {
-            let signal = crate::signals::take_pending();
+            let signal = signals::take_pending();
             if signal != 0 {
                 // The child is not reaped until its pipes close, keeping its group ID reserved.
                 unsafe {
@@ -83,7 +86,7 @@ pub fn execute(argv: &[OsString]) -> Result<Execution> {
         (status, completed, out.join(), err.join())
     });
     let status = status.context("wait for child")?;
-    let interrupted = crate::signals::received();
+    let interrupted = signals::received();
     let code = if interrupted != 0 {
         128 + interrupted
     } else {
@@ -124,10 +127,10 @@ pub struct Delivery([thread::JoinHandle<Result<()>>; 2]);
 
 impl Delivery {
     pub fn finish(self, code: i32) -> Result<i32> {
-        while crate::signals::received() == 0 && !self.0.iter().all(|writer| writer.is_finished()) {
+        while signals::received() == 0 && !self.0.iter().all(|writer| writer.is_finished()) {
             thread::sleep(Duration::from_millis(10));
         }
-        let signal = crate::signals::received();
+        let signal = signals::received();
         if signal != 0 {
             return Ok(128 + signal);
         }
@@ -142,30 +145,6 @@ impl Delivery {
         });
         delivery_result(out, err).map(|()| code)
     }
-}
-
-/// Combines the stdout and stderr delivery results. A reader that closed
-/// early (EPIPE) on one stream must not hide a different failure on the other.
-pub fn delivery_result(out: Result<()>, err: Result<()>) -> Result<()> {
-    match (out, err) {
-        (Err(out), Err(err)) if output_closed(&out) && !output_closed(&err) => Err(err),
-        (Err(error), _) | (Ok(()), Err(error)) => Err(error),
-        (Ok(()), Ok(())) => Ok(()),
-    }
-}
-
-pub fn output_closed(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(reader_closed)
-    })
-}
-
-/// Whether a write failed because its reader closed early, which callers treat
-/// as the reader's choice to stop rather than a tool failure.
-pub fn reader_closed(error: &std::io::Error) -> bool {
-    error.kind() == std::io::ErrorKind::BrokenPipe
 }
 
 fn exited_without_reaping(pid: u32) -> std::io::Result<bool> {
@@ -187,29 +166,5 @@ fn exited_without_reaping(pid: u32) -> std::io::Result<bool> {
             return Err(error);
         }
         Ok(info.si_pid() != 0)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::{Error, ErrorKind};
-
-    fn failed(kind: ErrorKind) -> Result<()> {
-        Err(anyhow::Error::from(Error::from(kind)).context("write"))
-    }
-
-    #[test]
-    fn a_closed_reader_never_hides_another_failure() {
-        let closed = || failed(ErrorKind::BrokenPipe);
-        let other = || failed(ErrorKind::Other);
-        let is_closed = |result: Result<()>| output_closed(&result.unwrap_err());
-        assert!(delivery_result(Ok(()), Ok(())).is_ok());
-        assert!(is_closed(delivery_result(closed(), Ok(()))));
-        assert!(is_closed(delivery_result(Ok(()), closed())));
-        assert!(is_closed(delivery_result(closed(), closed())));
-        assert!(!is_closed(delivery_result(closed(), other())));
-        assert!(!is_closed(delivery_result(other(), closed())));
-        assert!(!is_closed(delivery_result(Ok(()), other())));
     }
 }

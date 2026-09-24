@@ -1,4 +1,4 @@
-use crate::cache::Record;
+use crate::domain::record::Record;
 use std::{
     ffi::OsString,
     time::{Duration, SystemTime},

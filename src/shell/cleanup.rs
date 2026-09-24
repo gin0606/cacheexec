@@ -1,4 +1,7 @@
-use crate::{cache, runner, sharing};
+use crate::{
+    domain::delivery,
+    shell::{lock, store},
+};
 use anyhow::{Context, Result, bail};
 use std::{
     collections::BTreeSet,
@@ -14,7 +17,7 @@ fn old_enough(completed: SystemTime, age: Option<Duration>, now: SystemTime) -> 
 
 /// Unlinks an idle key's `.lock` while its lock is held. Callers waiting on the
 /// old inode see that it has no links left once they lock it, and reopen the
-/// path (see `sharing::acquire_gate`); checking the path alone would be racy.
+/// path (see `lock::acquire_gate`); checking the path alone would be racy.
 fn remove_gate(path: &Path) -> Result<()> {
     fs::remove_file(path).context("remove idle key lock")
 }
@@ -54,7 +57,7 @@ pub fn run(directory: &Path, age: Option<Duration>) -> Result<i32> {
     for key in keys {
         let outcome = (|| -> Result<()> {
             let gate_path = directory.join(format!("{key}.lock"));
-            let Some(_gate) = sharing::acquire_gate(&gate_path, false)? else {
+            let Some(_gate) = lock::acquire_gate(&gate_path, false)? else {
                 skipped += 1;
                 return Ok(());
             };
@@ -65,7 +68,7 @@ pub fn run(directory: &Path, age: Option<Duration>) -> Result<i32> {
                 Err(error) => return Err(error).context("open active execution"),
             };
             if let Some(active) = active {
-                if !sharing::try_lock(&active, true)? {
+                if !lock::try_lock(&active, true)? {
                     skipped += 1;
                     return Ok(());
                 }
@@ -75,11 +78,11 @@ pub fn run(directory: &Path, age: Option<Duration>) -> Result<i32> {
                 abandoned += 1;
             }
             let result_path = directory.join(format!("{key}.result"));
-            let completed = match cache::read(&result_path)? {
-                Some(cache::Stored::Current(record)) => Some(record.completed),
+            let completed = match store::read(&result_path)? {
+                Some(store::Stored::Current(record)) => Some(record.completed),
                 // Results are written right after completion, so the
                 // modification time stands in for an unreadable completion time.
-                Some(cache::Stored::OtherVersion) => Some(
+                Some(store::Stored::OtherVersion) => Some(
                     fs::metadata(&result_path)
                         .and_then(|metadata| metadata.modified())
                         .context("read result modification time")?,
@@ -119,7 +122,7 @@ pub fn run(directory: &Path, age: Option<Duration>) -> Result<i32> {
 /// still carry the counts, which would otherwise be lost.
 fn print_summary(summary: &str) -> Result<()> {
     match writeln!(std::io::stdout(), "{summary}") {
-        Err(error) if !runner::reader_closed(&error) => {
+        Err(error) if !delivery::reader_closed(&error) => {
             Err(error).with_context(|| format!("print cleanup summary ({summary})"))
         }
         _ => Ok(()),

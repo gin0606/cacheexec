@@ -1,16 +1,13 @@
-mod cache;
-mod cleanup;
-mod request;
-mod runner;
-mod sharing;
-mod signals;
-mod verbose;
+mod domain;
+mod shell;
 
 use anyhow::{Context, Result, bail};
 use clap::{
     Parser,
     error::{ContextKind, ContextValue, ErrorKind},
 };
+use domain::{key, policy};
+use shell::{cleanup, sharing, signals, verbose};
 use std::{ffi::OsString, path::PathBuf, time::Duration};
 
 #[derive(Debug, Parser)]
@@ -91,7 +88,7 @@ fn run(cli: Cli, diagnostic: &verbose::Verbose) -> Result<i32> {
         return cleanup::run(&directory, cli.older_than);
     }
     signals::install()?;
-    let request = request::Request {
+    let request = policy::Request {
         command: cli.command,
         ttl: cli.ttl.expect("clap requires --ttl without --clear"),
         refresh: cli.refresh,
@@ -99,7 +96,7 @@ fn run(cli: Cli, diagnostic: &verbose::Verbose) -> Result<i32> {
         exclude_codes: cli.exclude_codes,
     };
     let cwd = std::env::current_dir().context("read working directory")?;
-    let key = cache::key(&request.command, &cwd, cli.key.as_deref());
+    let key = key::key(&request.command, &cwd, cli.key.as_deref());
     let path = directory.join(format!("{key}.result"));
     std::fs::create_dir_all(&directory).context("create cache directory")?;
     sharing::run(&request, &directory, &key, &path, diagnostic)
