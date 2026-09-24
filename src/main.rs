@@ -122,6 +122,12 @@ fn parse_cli() -> Cli {
     })
 }
 
+/// How long a signal still waits for the tool error diagnostic to be written.
+/// The diagnostic is part of the exit code 125 contract, and a window of a
+/// few milliseconds from the writer's spawn is lost on a loaded host; this
+/// only delays exit when stderr is not being read.
+const ERROR_GRACE: Duration = Duration::from_millis(200);
+
 fn main() {
     let outcome = {
         let cli = parse_cli();
@@ -135,13 +141,15 @@ fn main() {
     let code = match outcome {
         Ok(code) => code,
         Err(error) => {
-            // A signal must not wait for a stderr consumer that stopped reading.
+            // A signal must not wait long for a stderr consumer that stopped
+            // reading, but the error still decides the exit code, so its
+            // diagnostic gets a short grace.
             let (printed, printing) = mpsc::channel::<Infallible>();
             std::thread::spawn(move || {
                 let _printed = printed;
                 eprintln!("cacheexec: {error:#}");
             });
-            let _ = signals::wait(&printing);
+            let _ = signals::wait_with_grace(&printing, ERROR_GRACE);
             125
         }
     };
