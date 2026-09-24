@@ -14,6 +14,9 @@ const SCRIPT: [&str; 6] = [
     "exit:7",
 ];
 
+/// The signals cacheexec forwards to the child and never caches.
+const FORWARDED: [i32; 4] = [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT, libc::SIGTERM];
+
 /// Like SCRIPT, without output.
 const QUIET: [&str; 4] = ["count", "event:started", "wait:go", "exit:7"];
 
@@ -115,7 +118,9 @@ impl Drop for Held {
 
 fn signal_name(signal: i32) -> &'static str {
     match signal {
+        libc::SIGHUP => "SIGHUP",
         libc::SIGINT => "SIGINT",
+        libc::SIGQUIT => "SIGQUIT",
         libc::SIGTERM => "SIGTERM",
         libc::SIGKILL => "SIGKILL",
         _ => "signal",
@@ -223,13 +228,13 @@ fn separate_keys_progress_independently_and_refresh_hides_previous_result() {
 fn owner_interrupt_propagates_and_is_never_saved_even_if_child_traps_it() {
     // The child handles the signal and exits 0, which must not be saved either.
     let steps = [
-        "trap:INT,TERM",
+        "trap:HUP,INT,QUIT,TERM",
         "count",
         "event:started",
         "wait:go",
         "exit:0",
     ];
-    for signal in [libc::SIGINT, libc::SIGTERM] {
+    for signal in FORWARDED {
         let name = signal_name(signal);
         let s = Sandbox::new();
         let mut go = s.gate("go");
@@ -258,7 +263,7 @@ fn owner_interrupt_propagates_and_is_never_saved_even_if_child_traps_it() {
 
 #[test]
 fn waiter_interrupt_does_not_stop_owner() {
-    for signal in [libc::SIGINT, libc::SIGTERM] {
+    for signal in FORWARDED {
         let name = signal_name(signal);
         let s = Sandbox::new();
         let mut go = s.gate("go");
@@ -689,6 +694,73 @@ fn cleanup_preserves_running_refresh_and_undelivered_waiter_generation() {
     assert_eq!(child_stderr(&replay.stderr), first.stderr);
     assert_eq!(code(&s.run(&["--ttl", "1h"], &SCRIPT)), Some(7));
     assert_eq!(s.count(), "xxx");
+}
+
+/// `cacheexec` for `steps`, started with `ignored` signals set to SIG_IGN.
+fn ignoring(
+    s: &Sandbox,
+    ignored: &[i32],
+    options: &[&str],
+    steps: &[&str],
+) -> std::process::Command {
+    use std::os::unix::process::CommandExt;
+    let mut command = s.cacheexec(&with_ttl(options), steps);
+    let ignored = ignored.to_vec();
+    unsafe {
+        command.pre_exec(move || {
+            for &signal in &ignored {
+                libc::signal(signal, libc::SIG_IGN);
+            }
+            Ok(())
+        });
+    }
+    command
+}
+
+#[test]
+fn signals_ignored_at_startup_stay_ignored_for_owner_and_child() {
+    for signal in FORWARDED {
+        let name = signal_name(signal);
+        let s = Sandbox::new();
+        let mut go = s.gate("go");
+        let leader = s.spawn(
+            "owner",
+            ignoring(&s, &[signal], &["--include-codes", "7"], &QUIET),
+        );
+        let child = s.wait_event("started");
+        leader.signal(signal);
+        // The child leads its own process group, so signal it directly too.
+        assert_eq!(unsafe { libc::killpg(child, signal) }, 0);
+        go.release();
+        assert_eq!(code(&leader.finish()), Some(7), "owner ignoring {name}");
+        assert_eq!(code(&s.run(&["--ttl", "1h"], &QUIET)), Some(7));
+        assert_eq!(s.count(), "x", "the result was not saved ignoring {name}");
+    }
+}
+
+#[test]
+fn ignoring_some_signals_at_startup_keeps_the_others_handled() {
+    // `nohup` ignores SIGHUP; `cmd &` in a non-interactive shell ignores
+    // SIGINT and SIGQUIT.
+    for ignored in [&[libc::SIGHUP][..], &[libc::SIGINT, libc::SIGQUIT][..]] {
+        let s = Sandbox::new();
+        let mut go = s.gate("go");
+        let leader = s.spawn(
+            "owner",
+            ignoring(&s, ignored, &["--include-codes", "0"], &QUIET),
+        );
+        s.wait_event("started");
+        leader.signal(libc::SIGTERM);
+        // The forwarded signal ends the child without waiting for `go`.
+        assert_eq!(
+            code(&leader.finish()),
+            Some(128 + libc::SIGTERM),
+            "ignoring {ignored:?}"
+        );
+        go.release();
+        assert_eq!(code(&s.run(&["--ttl", "1h"], &QUIET)), Some(7));
+        assert_eq!(s.count(), "xx", "ignoring {ignored:?}");
+    }
 }
 
 #[test]

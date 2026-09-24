@@ -23,9 +23,18 @@ pub fn seal_execution() -> i32 {
     SIGNAL.fetch_or(SEALED, Ordering::SeqCst) & !SEALED
 }
 pub fn install() -> Result<()> {
-    for signal in [libc::SIGINT, libc::SIGTERM] {
+    for signal in [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT, libc::SIGTERM] {
         // The handler only stores an atomic; all process and file operations stay outside it.
         unsafe {
+            let mut inherited: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(signal, std::ptr::null(), &mut inherited) != 0 {
+                return Err(std::io::Error::last_os_error()).context("read signal disposition");
+            }
+            // Keep signals the caller ignored (nohup, background jobs) ignored,
+            // for this process and, through exec, for the child.
+            if inherited.sa_sigaction == libc::SIG_IGN {
+                continue;
+            }
             let mut action: libc::sigaction = std::mem::zeroed();
             action.sa_sigaction = handler as *const () as usize;
             libc::sigemptyset(&mut action.sa_mask);
