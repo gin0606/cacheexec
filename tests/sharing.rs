@@ -322,6 +322,57 @@ fn save_failure_is_shared_without_retry() {
 }
 
 #[test]
+fn shared_write_failure_is_shared_and_never_published_as_success() {
+    use std::os::unix::process::CommandExt;
+    // Nobody allows exit 7, so nothing is saved and the first large write is
+    // the shared copy of the output, which exceeds the owner's file size limit.
+    let steps = [
+        "count",
+        "event:started",
+        "wait:go",
+        "zeros:1048576:0",
+        "exit:7",
+    ];
+    let s = Sandbox::new();
+    let mut go = s.gate("go");
+    let mut command = s.cacheexec(&["--ttl", "1h", "--include-codes", "0"], &steps);
+    unsafe {
+        command.pre_exec(|| {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            let limit = libc::rlimit {
+                rlim_cur: 65536,
+                rlim_max: 65536,
+            };
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let leader = s.spawn("owner", command);
+    s.wait_event("started");
+    let joined = waiter(&s, "waiter", &["--include-codes", "1"], &steps, 1);
+    go.release();
+    let (leader, joined) = (leader.finish(), joined.finish());
+    // The owner streams the output as the child writes it; a waiter only
+    // replays a published result.
+    assert!(
+        joined.stdout.is_empty(),
+        "the waiter replayed a failed result"
+    );
+    for (name, output) in [("owner", leader), ("waiter", joined)] {
+        assert_eq!(code(&output), Some(125), "{name}");
+        assert!(
+            text(&output.stderr).contains("child already completed with exit code 7"),
+            "{name}: {}",
+            text(&output.stderr)
+        );
+    }
+    assert!(s.cache_files("result").is_empty());
+    assert_eq!(s.count(), "x");
+}
+
+#[test]
 fn owner_streams_and_many_late_waiters_receive_complete_bytes() {
     let steps = [
         "count",
