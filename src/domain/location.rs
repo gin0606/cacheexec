@@ -1,12 +1,17 @@
 use std::{ffi::OsString, path::PathBuf};
 
-/// Empty variables count as unset.
+/// Empty variables count as unset, as does a relative `XDG_CACHE_HOME`, which
+/// the XDG Base Directory spec says to ignore so that storage does not depend
+/// on the working directory.
 pub fn default_cache_dir(
     xdg_cache_home: Option<OsString>,
     home: Option<OsString>,
 ) -> Option<PathBuf> {
-    if let Some(path) = xdg_cache_home.filter(|s| !s.is_empty()) {
-        return Some(PathBuf::from(path).join("cacheexec"));
+    if let Some(path) = xdg_cache_home
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    {
+        return Some(path.join("cacheexec"));
     }
     if let Some(path) = home.filter(|s| !s.is_empty()) {
         return Some(PathBuf::from(path).join(".cache/cacheexec"));
@@ -72,6 +77,20 @@ mod tests {
         );
         assert_eq!(default_cache_dir(None, some("")), None);
         assert_eq!(default_cache_dir(None, None), None);
+    }
+
+    #[test]
+    fn relative_xdg_cache_home_is_unset() {
+        let some = |s: &str| Some(OsString::from(s));
+        for xdg in ["cache", "./cache", "../x"] {
+            assert_eq!(
+                default_cache_dir(some(xdg), some("/h")),
+                Some(PathBuf::from("/h/.cache/cacheexec")),
+                "{xdg}"
+            );
+            assert_eq!(default_cache_dir(some(xdg), some("")), None, "{xdg}");
+            assert_eq!(default_cache_dir(some(xdg), None), None, "{xdg}");
+        }
     }
 
     #[test]

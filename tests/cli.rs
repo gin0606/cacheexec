@@ -595,13 +595,24 @@ fn default_cache_directory_follows_xdg_then_home() {
         home.join(".cache/cacheexec").is_dir(),
         "an empty XDG_CACHE_HOME was used"
     );
-    let output = run(None, None);
-    assert_eq!(code(&output), Some(125));
+    fs::remove_dir_all(&home).unwrap();
+    assert_eq!(code(&run(Some("rel"), Some(&home))), Some(0));
     assert!(
-        stderr(&output).contains("supply --cache-dir"),
-        "{}",
-        stderr(&output)
+        home.join(".cache/cacheexec").is_dir(),
+        "a relative XDG_CACHE_HOME was used"
     );
+    assert!(!s.path("rel").exists());
+    for xdg in [None, Some("rel")] {
+        let output = run(xdg, None);
+        assert_eq!(code(&output), Some(125), "{xdg:?}");
+        assert!(
+            stderr(&output)
+                .contains("neither an absolute XDG_CACHE_HOME nor HOME is set; supply --cache-dir"),
+            "{}",
+            stderr(&output)
+        );
+    }
+    assert!(!s.path("rel").exists());
 }
 
 #[test]

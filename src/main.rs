@@ -39,7 +39,7 @@ Exit codes:
   diagnostic.
 
 Storage and cleanup:
-  $XDG_CACHE_HOME/cacheexec or $HOME/.cache/cacheexec; override with --cache-dir.
+  $XDG_CACHE_HOME/cacheexec (absolute only) or $HOME/.cache/cacheexec; override with --cache-dir.
   --clear takes no command or TTL, skips busy keys and reports counts.
   There is no automatic cleanup.
   See README.md / README.ja.md for recovery steps and full behavior."
@@ -103,7 +103,7 @@ fn run(cli: Cli, diagnostic: &verbose::Verbose) -> Result<i32> {
 
 fn default_cache_dir() -> Result<PathBuf> {
     location::default_cache_dir(std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME"))
-        .context("neither XDG_CACHE_HOME nor HOME is set; supply --cache-dir")
+        .context("neither an absolute XDG_CACHE_HOME nor HOME is set; supply --cache-dir")
 }
 
 fn parse_cli() -> Cli {
