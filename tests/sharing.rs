@@ -1,7 +1,12 @@
 mod common;
 
 use common::{FullPipe, Proc, Sandbox, child_stderr, code, text, verbose_lines};
-use std::{fs, os::fd::AsRawFd, process::Output};
+use std::{
+    fs,
+    os::fd::AsRawFd,
+    process::Output,
+    time::{Duration, Instant},
+};
 
 /// Counts the execution, reports `started`, waits for `go`, then writes
 /// non-UTF-8 bytes to both streams and exits 7.
@@ -653,6 +658,53 @@ fn interruption_with_storage_error_does_not_block_on_stderr_diagnostic() {
     s.wait_event("finished");
     leader.signal(libc::SIGTERM);
     assert_eq!(code(&leader.finish()), Some(125));
+}
+
+#[test]
+fn tool_error_after_a_signal_reports_its_diagnostic_unless_stderr_is_stuck() {
+    // The trapped signal ends the first wait, so `trapped` shows the owner
+    // received the signal it forwarded before publication fails.
+    let steps = [
+        "trap:INT",
+        "event:started",
+        "wait:go",
+        "event:trapped",
+        "wait:publish",
+        "exit:0",
+    ];
+    for stuck in [false, true] {
+        let s = Sandbox::new();
+        let _go = s.gate("go");
+        let mut publish = s.gate("publish");
+        let full = FullPipe::new();
+        let mut command = s.cacheexec(&["--ttl", "1h"], &steps);
+        if stuck {
+            command.stderr(full.blocking());
+        }
+        let leader = s.spawn("owner", command);
+        s.wait_event("started");
+        leader.signal(libc::SIGINT);
+        s.wait_event("trapped");
+        fs::remove_file(s.cache_file("active")).unwrap();
+        publish.release();
+        let released = Instant::now();
+        let output = leader.finish();
+        let elapsed = released.elapsed();
+        assert_eq!(code(&output), Some(125), "stuck: {stuck}");
+        if stuck {
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "exit took {elapsed:?} with stuck stderr"
+            );
+        } else {
+            let stderr = text(&output.stderr);
+            assert!(
+                stderr.contains("cacheexec: ")
+                    && stderr.contains("remove completed execution marker"),
+                "no diagnostic: {stderr:?}"
+            );
+        }
+    }
 }
 
 #[test]
