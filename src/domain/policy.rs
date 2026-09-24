@@ -12,6 +12,18 @@ pub struct Request {
     pub exclude_codes: Option<Vec<u8>>,
 }
 
+/// Why a caller cannot reuse a saved result and runs the command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reason {
+    Refresh,
+    Missing,
+    /// The result completed after the current time.
+    FutureTimestamp,
+    Expired,
+    /// The caller's policy does not accept the result's exit code.
+    Policy,
+}
+
 impl Request {
     pub fn allows(&self, code: i32) -> bool {
         let Ok(code) = u8::try_from(code) else {
@@ -27,21 +39,21 @@ impl Request {
     }
 
     /// Returns why a new execution is required, or `None` when `record` is reusable.
-    pub fn reason(&self, record: Option<&Record>, now: SystemTime) -> Option<&'static str> {
+    pub fn reason(&self, record: Option<&Record>, now: SystemTime) -> Option<Reason> {
         if self.refresh {
-            return Some("refresh");
+            return Some(Reason::Refresh);
         }
         let Some(record) = record else {
-            return Some("missing");
+            return Some(Reason::Missing);
         };
         if now.duration_since(record.completed).is_err() {
-            return Some("future-timestamp");
+            return Some(Reason::FutureTimestamp);
         }
         if !record.fresh(self.ttl, now) {
-            return Some("expired");
+            return Some(Reason::Expired);
         }
         if !self.allows(record.code) {
-            return Some("policy");
+            return Some(Reason::Policy);
         }
         None
     }
@@ -80,15 +92,15 @@ mod tests {
                                 stderr: vec![],
                             };
                             let expected = if refresh {
-                                Some("refresh")
+                                Some(Reason::Refresh)
                             } else if missing {
-                                Some("missing")
+                                Some(Reason::Missing)
                             } else if future {
-                                Some("future-timestamp")
+                                Some(Reason::FutureTimestamp)
                             } else if expired {
-                                Some("expired")
+                                Some(Reason::Expired)
                             } else if excluded {
-                                Some("policy")
+                                Some(Reason::Policy)
                             } else {
                                 None
                             };

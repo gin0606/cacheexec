@@ -1,4 +1,4 @@
-use crate::domain::message;
+use crate::domain::message::{self, Decision, Failure, Saved};
 use std::{
     cell::Cell,
     fs::File,
@@ -81,7 +81,7 @@ impl Verbose {
 
     pub fn decision(
         &self,
-        action: &str,
+        decision: Decision,
         age: Option<Result<Duration, std::time::SystemTimeError>>,
         ttl: Duration,
         directory: &Path,
@@ -91,7 +91,7 @@ impl Verbose {
             return;
         }
         let directory = std::path::absolute(directory).unwrap_or_else(|_| directory.to_path_buf());
-        self.emit(message::decision(action, age, ttl, &directory, key));
+        self.emit(message::decision(decision, age, ttl, &directory, key));
     }
 
     pub fn finish(&self, message: String) {
@@ -100,8 +100,8 @@ impl Verbose {
         }
     }
 
-    pub fn failed(&self, saved: &str) {
-        self.finish(message::failed(saved, "failure"));
+    pub fn failed(&self, saved: Saved) {
+        self.finish(message::failed(saved, Failure::Execution));
     }
 }
 

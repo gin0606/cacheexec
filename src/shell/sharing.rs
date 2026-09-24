@@ -2,7 +2,7 @@ use crate::{
     domain::{
         delivery,
         execution::{self, CODES, Outcome, Saving, Votes, signal_code},
-        message,
+        message::{self, Decision, Failure, Saved, Wait},
         policy::Request,
         record::Record,
         shared::{self, COMPLETED, DETAIL_OFFSET, FAILED, Published, TAG_OFFSET},
@@ -37,9 +37,9 @@ fn vote(file: &mut File, request: &Request) -> Result<()> {
     Ok(())
 }
 
-fn interrupted(diagnostic: &Verbose, reason: &str) -> i32 {
+fn interrupted(diagnostic: &Verbose, wait: Wait) -> i32 {
     let code = signal_code(signals::received());
-    diagnostic.finish(message::interrupted(code, reason));
+    diagnostic.finish(message::interrupted(code, wait));
     code
 }
 
@@ -55,7 +55,7 @@ pub fn run(
     diagnostic: &Verbose,
 ) -> Result<i32> {
     let Some(gate) = acquire_gate(&directory.join(format!("{key}.lock")), true)? else {
-        return Ok(interrupted(diagnostic, "interrupted"));
+        return Ok(interrupted(diagnostic, Wait::Key));
     };
     let active_path = directory.join(format!("{key}.active"));
     match OpenOptions::new().read(true).write(true).open(&active_path) {
@@ -63,7 +63,7 @@ pub fn run(
             if !try_lock(&active, true)? {
                 vote(&mut active, request)?;
                 unlock(&gate)?;
-                diagnostic.decision("join", None, request.ttl, directory, key);
+                diagnostic.decision(Decision::Join, None, request.ttl, directory, key);
                 return join(active, diagnostic);
             }
             // An open descriptor identifies this generation even after its name is reused.
@@ -79,11 +79,10 @@ pub fn run(
         .map(|record| now.duration_since(record.completed));
     let Some(reason) = request.reason(previous.as_ref(), now) else {
         unlock(&gate)?;
-        diagnostic.decision("hit", age, request.ttl, directory, key);
+        diagnostic.decision(Decision::Hit, age, request.ttl, directory, key);
         return replay(
             previous.expect("hit requires a result"),
-            "no reason=reused",
-            false,
+            Saved::Reused,
             diagnostic,
         );
     };
@@ -101,13 +100,7 @@ pub fn run(
     active.write_all(&shared::pending())?;
     vote(&mut active, request)?;
     unlock(&gate)?;
-    diagnostic.decision(
-        &format!("run reason={reason}"),
-        age,
-        request.ttl,
-        directory,
-        key,
-    );
+    diagnostic.decision(Decision::Run(reason), age, request.ttl, directory, key);
     own(
         request,
         &gate,
@@ -120,24 +113,21 @@ pub fn run(
 
 fn join(mut active: File, diagnostic: &Verbose) -> Result<i32> {
     if !lock(&active, true)? {
-        return Ok(interrupted(diagnostic, "waiter-interrupted"));
+        return Ok(interrupted(diagnostic, Wait::Execution));
     }
     active.seek(SeekFrom::Start(TAG_OFFSET))?;
     let mut bytes = Vec::new();
     active.read_to_end(&mut bytes)?;
     unlock(&active)?;
     match shared::parse(&bytes)? {
-        Published::Completed { saving, record } => replay(
-            record,
-            saving.describe(),
-            saving == Saving::Interrupted,
-            diagnostic,
-        ),
+        Published::Completed { saving, record } => {
+            replay(record, Saved::Execution(saving), diagnostic)
+        }
         Published::Failed {
             invalidated,
             message: failure,
         } => {
-            diagnostic.failed(message::saved_after_failure(invalidated));
+            diagnostic.failed(Saved::after_failure(invalidated));
             bail!("shared execution failed: {failure}");
         }
         Published::Unfinished => bail!(
@@ -197,7 +187,7 @@ fn own(
     if let Err(error) = &outcome {
         let invalidation = store::invalidate(result_path);
         let invalidated = invalidation.is_ok();
-        diagnostic.failed(message::saved_after_failure(invalidated));
+        diagnostic.failed(Saved::after_failure(invalidated));
         let message = match invalidation {
             Ok(()) => format!("{error:#}"),
             Err(cleanup) => format!("{error:#}; could not invalidate result: {cleanup:#}"),
@@ -211,21 +201,19 @@ fn own(
     report(
         delivery.finish(code),
         code,
-        saving.describe(),
-        saving == Saving::Interrupted,
-        "delivery-failure",
+        Saved::Execution(saving),
+        Failure::Delivery,
         diagnostic,
     )
 }
 
-fn replay(record: Record, saving: &str, interrupted: bool, diagnostic: &Verbose) -> Result<i32> {
+fn replay(record: Record, saved: Saved, diagnostic: &Verbose) -> Result<i32> {
     let code = record.code;
     report(
         replay::write(record),
         code,
-        saving,
-        interrupted,
-        "replay-failure",
+        saved,
+        Failure::Replay,
         diagnostic,
     )
 }
@@ -233,20 +221,19 @@ fn replay(record: Record, saving: &str, interrupted: bool, diagnostic: &Verbose)
 fn report(
     outcome: Result<i32>,
     command_code: i32,
-    saving: &str,
-    generation_interrupted: bool,
-    failure: &str,
+    saved: Saved,
+    failure: Failure,
     diagnostic: &Verbose,
 ) -> Result<i32> {
     // Sampled once so the exit status and its label cannot disagree.
     let signal = signals::received();
-    match delivery::classify(outcome, command_code, signal, generation_interrupted) {
-        Ok((code, kind)) => {
-            diagnostic.finish(message::finished(kind, code, saving));
+    match delivery::classify(outcome, command_code, signal, saved.interrupted()) {
+        Ok((code, ending)) => {
+            diagnostic.finish(message::finished(ending, code, saved));
             Ok(code)
         }
         Err(error) => {
-            diagnostic.finish(message::failed(saving, failure));
+            diagnostic.finish(message::failed(saved, failure));
             Err(error)
         }
     }

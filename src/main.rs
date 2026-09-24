@@ -129,7 +129,7 @@ fn main() {
         let diagnostic = verbose::Verbose::new(cli.verbose);
         let outcome = run(cli, &diagnostic);
         if outcome.is_err() {
-            diagnostic.failed("unknown");
+            diagnostic.failed(domain::message::Saved::Unknown);
         }
         outcome
     };

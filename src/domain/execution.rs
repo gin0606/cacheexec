@@ -103,13 +103,6 @@ impl Saving {
             _ => bail!("invalid shared saving status"),
         })
     }
-    pub fn describe(self) -> &'static str {
-        match self {
-            Self::Saved => "yes",
-            Self::Excluded => "no reason=participant-policy",
-            Self::Interrupted => "no reason=interrupted",
-        }
-    }
 }
 
 #[cfg(test)]

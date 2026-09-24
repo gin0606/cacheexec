@@ -25,30 +25,38 @@ pub fn reader_closed(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::BrokenPipe
 }
 
-/// The exit status and completion label of a delivery or replay outcome.
+/// How a delivery or replay that did not fail ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ending {
+    Completed,
+    OutputClosed,
+    Interrupted,
+}
+
+/// The exit status and ending of a delivery or replay outcome.
 pub fn classify(
     outcome: Result<i32>,
     command_code: i32,
     signal: i32,
     generation_interrupted: bool,
-) -> Result<(i32, &'static str)> {
-    let (code, kind) = match outcome {
+) -> Result<(i32, Ending)> {
+    let (code, ending) = match outcome {
         // A signal received during delivery ends it with 128 + signal however
         // delivery ended, as live delivery and replay do.
-        _ if signal != 0 => (signal_code(signal), "interrupted"),
-        Ok(code) => (code, "completed"),
+        _ if signal != 0 => (signal_code(signal), Ending::Interrupted),
+        Ok(code) => (code, Ending::Completed),
         // A consumer such as `head` closing its end is a normal way to stop
         // reading, not a tool failure. The status of the delivered result is
         // still known, so it is reported; shared and saved results stay intact.
-        Err(error) if output_closed(&error) => (command_code, "output-closed"),
+        Err(error) if output_closed(&error) => (command_code, Ending::OutputClosed),
         Err(error) => return Err(error),
     };
     Ok((
         code,
         if generation_interrupted {
-            "interrupted"
+            Ending::Interrupted
         } else {
-            kind
+            ending
         },
     ))
 }
@@ -71,16 +79,19 @@ mod tests {
     fn a_signal_during_delivery_wins_over_every_outcome() {
         for outcome in [Ok(3), Err(closed()), Err(anyhow::anyhow!("disk full"))] {
             let classified = classify(outcome, 3, 15, false).unwrap();
-            assert_eq!(classified, (143, "interrupted"));
+            assert_eq!(classified, (143, Ending::Interrupted));
         }
     }
 
     #[test]
     fn a_closed_reader_keeps_the_command_status_and_other_failures_are_errors() {
-        assert_eq!(classify(Ok(7), 7, 0, false).unwrap(), (7, "completed"));
+        assert_eq!(
+            classify(Ok(7), 7, 0, false).unwrap(),
+            (7, Ending::Completed)
+        );
         assert_eq!(
             classify(Err(closed()), 7, 0, false).unwrap(),
-            (7, "output-closed")
+            (7, Ending::OutputClosed)
         );
         assert!(classify(Err(anyhow::anyhow!("EIO")), 7, 0, false).is_err());
     }
@@ -89,11 +100,11 @@ mod tests {
     fn an_interrupted_generation_is_labelled_interrupted() {
         assert_eq!(
             classify(Ok(143), 143, 0, true).unwrap(),
-            (143, "interrupted")
+            (143, Ending::Interrupted)
         );
         assert_eq!(
             classify(Err(closed()), 143, 0, true).unwrap(),
-            (143, "interrupted")
+            (143, Ending::Interrupted)
         );
     }
 
