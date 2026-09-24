@@ -63,10 +63,6 @@ impl Outcome {
         self.record.code
     }
 
-    pub fn savable(&self, votes: &Votes) -> bool {
-        self.reusable && u8::try_from(self.code()).is_ok_and(|code| votes[usize::from(code)] != 0)
-    }
-
     /// Marks the outcome as interrupted by `signal`; 0 means no signal and
     /// changes nothing. Returns whether anything observable changed.
     pub fn interrupt(&mut self, signal: i32) -> bool {
@@ -80,6 +76,8 @@ impl Outcome {
     }
 }
 
+/// Whether an outcome is saved, which decides both the save itself and the
+/// `saved=` label that the owner and its waiters report.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Saving {
     Saved = 1,
@@ -91,7 +89,7 @@ impl Saving {
     pub fn of(outcome: &Outcome, votes: &Votes) -> Self {
         if !outcome.reusable {
             Self::Interrupted
-        } else if outcome.savable(votes) {
+        } else if u8::try_from(outcome.code()).is_ok_and(|code| votes[usize::from(code)] != 0) {
             Self::Saved
         } else {
             Self::Excluded

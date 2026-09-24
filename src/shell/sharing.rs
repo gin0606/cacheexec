@@ -167,7 +167,7 @@ fn own(
         let votes = read_votes(&mut active)?;
         let child = &mut execution.outcome;
         apply_interrupt(child, result_path)?;
-        if child.savable(&votes) {
+        if Saving::of(child, &votes) == Saving::Saved {
             store::save(result_path, child.record())
                 .with_context(|| format!("could not save result {result_path:?}"))?;
         }
