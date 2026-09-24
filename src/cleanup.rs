@@ -75,11 +75,20 @@ pub fn run(directory: &Path, age: Option<Duration>) -> Result<i32> {
                 abandoned += 1;
             }
             let result_path = directory.join(format!("{key}.result"));
-            if let Some(record) = cache::load(&result_path)? {
-                if old_enough(record.completed, age, now) {
-                    fs::remove_file(&result_path).context("delete cached result")?;
-                    removed += 1;
-                }
+            let completed = match cache::read(&result_path)? {
+                Some(cache::Stored::Current(record)) => Some(record.completed),
+                // Results are written right after completion, so the
+                // modification time stands in for an unreadable completion time.
+                Some(cache::Stored::OtherVersion) => Some(
+                    fs::metadata(&result_path)
+                        .and_then(|metadata| metadata.modified())
+                        .context("read result modification time")?,
+                ),
+                None => None,
+            };
+            if completed.is_some_and(|completed| old_enough(completed, age, now)) {
+                fs::remove_file(&result_path).context("delete cached result")?;
+                removed += 1;
             }
             Ok(())
         })();
