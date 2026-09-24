@@ -8,7 +8,7 @@ use clap::{
 };
 use domain::{key, location, policy};
 use shell::{cleanup, sharing, signals, verbose};
-use std::{ffi::OsString, path::PathBuf, time::Duration};
+use std::{convert::Infallible, ffi::OsString, path::PathBuf, sync::mpsc, time::Duration};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -135,10 +135,13 @@ fn main() {
     let code = match outcome {
         Ok(code) => code,
         Err(error) => {
-            let diagnostic = std::thread::spawn(move || eprintln!("cacheexec: {error:#}"));
-            while !diagnostic.is_finished() && signals::received() == 0 {
-                std::thread::sleep(Duration::from_millis(10));
-            }
+            // A signal must not wait for a stderr consumer that stopped reading.
+            let (printed, printing) = mpsc::channel::<Infallible>();
+            std::thread::spawn(move || {
+                let _printed = printed;
+                eprintln!("cacheexec: {error:#}");
+            });
+            let _ = signals::wait(&printing);
             125
         }
     };
