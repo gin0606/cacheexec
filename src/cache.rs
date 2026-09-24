@@ -10,6 +10,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+// "CEXEC" followed by a three-digit format version.
 const MAGIC: &[u8; 8] = b"CEXEC001";
 
 pub struct Record {
@@ -80,19 +81,44 @@ pub fn key(argv: &[OsString], cwd: &Path, extra: Option<&OsStr>) -> String {
     format!("{:x}", digest.finalize())
 }
 
-pub fn load(path: &Path) -> Result<Option<Record>> {
+pub enum Stored {
+    Current(Record),
+    /// Written in another format version, so this binary can neither reuse nor
+    /// verify it. Callers treat it as absent rather than corrupt, keeping format
+    /// upgrades and downgrades free of manual recovery.
+    OtherVersion,
+}
+
+pub fn read(path: &Path) -> Result<Option<Stored>> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("read cached result {path:?}")),
     };
+    if other_version(&bytes) {
+        return Ok(Some(Stored::OtherVersion));
+    }
     decode(&bytes)
         .with_context(|| {
             format!(
                 "corrupt cached result {path:?}. Recovery: stop all cacheexec invocations using this cache directory, remove only this .result file, then retry; keep .lock and .active files"
             )
         })
-        .map(Some)
+        .map(|record| Some(Stored::Current(record)))
+}
+
+pub fn load(path: &Path) -> Result<Option<Record>> {
+    Ok(match read(path)? {
+        Some(Stored::Current(record)) => Some(record),
+        Some(Stored::OtherVersion) | None => None,
+    })
+}
+
+fn other_version(bytes: &[u8]) -> bool {
+    bytes.len() >= MAGIC.len()
+        && bytes[..MAGIC.len()] != MAGIC[..]
+        && bytes[..5] == MAGIC[..5]
+        && bytes[5..MAGIC.len()].iter().all(u8::is_ascii_digit)
 }
 
 pub fn decode(bytes: &[u8]) -> Result<Record> {
@@ -165,6 +191,16 @@ pub fn save(path: &Path, record: &Record) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_another_three_digit_version_is_another_format() {
+        assert!(!other_version(MAGIC));
+        assert!(other_version(b"CEXEC002"));
+        assert!(other_version(b"CEXEC999 and more"));
+        for bytes in [&b"CEXEC00x"[..], b"CEXEC00", b"cexec002", b"XEXEC002"] {
+            assert!(!other_version(bytes), "{bytes:?}");
+        }
+    }
+
     #[test]
     fn ttl_boundary_and_future_clock() {
         let record = Record {

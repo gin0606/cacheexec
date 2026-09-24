@@ -337,6 +337,37 @@ fn corruption_is_an_error_and_never_executes_child() {
 }
 
 #[test]
+fn other_format_versions_are_misses_and_clearable() {
+    let s = Sandbox::new();
+    s.run(&["--ttl", "1h"], &BYTES);
+    let result = s.cache_file("result");
+    fs::write(&result, b"CEXEC999 written by another version").unwrap();
+    assert_eq!(code(&s.run(&["--ttl", "1h"], &BYTES)), Some(0));
+    assert_eq!(s.count(), "xx");
+    assert!(fs::read(&result).unwrap().starts_with(b"CEXEC001"));
+    assert_eq!(code(&s.run(&["--ttl", "1h"], &BYTES)), Some(0));
+    assert_eq!(s.count(), "xx");
+
+    // Without a readable completion time, age-based cleanup uses the mtime.
+    fs::write(&result, b"CEXEC999").unwrap();
+    let clear = |options: &[&str]| {
+        let output = s.clear(options);
+        assert_eq!(code(&output), Some(0), "{}", stderr(&output));
+        stdout(&output)
+    };
+    assert!(clear(&["--older-than", "24h"]).starts_with("removed=0 "));
+    fs::File::options()
+        .write(true)
+        .open(&result)
+        .unwrap()
+        .set_modified(UNIX_EPOCH + Duration::from_secs(946_684_800))
+        .unwrap();
+    assert!(clear(&["--older-than", "24h"]).starts_with("removed=1 "));
+    fs::write(&result, b"CEXEC999").unwrap();
+    assert!(clear(&[]).starts_with("removed=1 "));
+}
+
+#[test]
 fn spawn_failure_and_signals_are_not_cached() {
     let s = Sandbox::new();
     let program = s.path("program");
