@@ -5,10 +5,8 @@ use std::{
     os::fd::{AsRawFd, FromRawFd},
     path::Path,
     sync::mpsc::{self, Receiver, Sender},
-    time::{Duration, SystemTime},
+    time::Duration,
 };
-
-use crate::{Cli, cache::Record};
 
 pub struct Verbose {
     sender: Option<Sender<String>>,
@@ -84,7 +82,7 @@ impl Verbose {
         &self,
         action: &str,
         age: Option<Result<Duration, std::time::SystemTimeError>>,
-        cli: &Cli,
+        ttl: Duration,
         directory: &Path,
         key: &str,
     ) {
@@ -99,7 +97,7 @@ impl Verbose {
         let directory = std::path::absolute(directory).unwrap_or_else(|_| directory.to_path_buf());
         self.emit(format!(
             "{action}{age} ttl={} key={key} cache-dir={directory:?}",
-            humantime::format_duration(cli.ttl.expect("execution requires TTL")),
+            humantime::format_duration(ttl),
         ));
     }
 
@@ -135,76 +133,5 @@ fn safe_destination(output: &File) -> bool {
         stat.st_mode & libc::S_IFMT != libc::S_IFREG
             || (libc::getrlimit(libc::RLIMIT_FSIZE, &mut limit) == 0
                 && limit.rlim_cur == libc::RLIM_INFINITY)
-    }
-}
-
-pub fn reason(cli: &Cli, record: Option<&Record>, now: SystemTime) -> Option<&'static str> {
-    if cli.refresh {
-        return Some("refresh");
-    }
-    let Some(record) = record else {
-        return Some("missing");
-    };
-    if now.duration_since(record.completed).is_err() {
-        return Some("future-timestamp");
-    }
-    if !record.fresh(cli.ttl.expect("execution requires TTL"), now) {
-        return Some("expired");
-    }
-    if !cli.allows(record.code) {
-        return Some("policy");
-    }
-    None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use clap::Parser;
-    use std::time::UNIX_EPOCH;
-
-    #[test]
-    fn reason_priority_and_ttl_boundary() {
-        let now = UNIX_EPOCH + Duration::from_secs(100);
-        for refresh in [false, true] {
-            for missing in [false, true] {
-                for future in [false, true] {
-                    for expired in [false, true] {
-                        for excluded in [false, true] {
-                            let mut cli =
-                                Cli::parse_from(["cacheexec", "--ttl", "5s", "--", "true"]);
-                            cli.refresh = refresh;
-                            cli.exclude_codes = excluded.then_some(vec![0]);
-                            let record = Record {
-                                completed: if future {
-                                    now + Duration::from_secs(1)
-                                } else if expired {
-                                    now - Duration::from_secs(6)
-                                } else {
-                                    now - Duration::from_secs(5)
-                                },
-                                code: 0,
-                                stdout: vec![],
-                                stderr: vec![],
-                            };
-                            let expected = if refresh {
-                                Some("refresh")
-                            } else if missing {
-                                Some("missing")
-                            } else if future {
-                                Some("future-timestamp")
-                            } else if expired {
-                                Some("expired")
-                            } else if excluded {
-                                Some("policy")
-                            } else {
-                                None
-                            };
-                            assert_eq!(reason(&cli, (!missing).then_some(&record), now), expected);
-                        }
-                    }
-                }
-            }
-        }
     }
 }

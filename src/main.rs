@@ -1,5 +1,6 @@
 mod cache;
 mod cleanup;
+mod request;
 mod runner;
 mod sharing;
 mod signals;
@@ -77,34 +78,26 @@ struct Cli {
     command: Vec<OsString>,
 }
 
-impl Cli {
-    fn allows(&self, code: i32) -> bool {
-        let Ok(code) = u8::try_from(code) else {
-            return false;
-        };
-        self.include_codes
-            .as_ref()
-            .is_none_or(|codes| codes.contains(&code))
-            && self
-                .exclude_codes
-                .as_ref()
-                .is_none_or(|codes| !codes.contains(&code))
-    }
-}
-
 fn run(cli: Cli, diagnostic: &verbose::Verbose) -> Result<i32> {
-    let directory = match cli.cache_dir.clone() {
+    let directory = match cli.cache_dir {
         Some(path) => path,
         None => default_cache_dir()?,
     };
     if cli.clear {
         return cleanup::run(&directory, cli.older_than);
     }
+    let request = request::Request {
+        command: cli.command,
+        ttl: cli.ttl.expect("clap requires --ttl without --clear"),
+        refresh: cli.refresh,
+        include_codes: cli.include_codes,
+        exclude_codes: cli.exclude_codes,
+    };
     let cwd = std::env::current_dir().context("read working directory")?;
-    let key = cache::key(&cli.command, &cwd, cli.key.as_deref());
+    let key = cache::key(&request.command, &cwd, cli.key.as_deref());
     let path = directory.join(format!("{key}.result"));
     std::fs::create_dir_all(&directory).context("create cache directory")?;
-    sharing::run(&cli, &directory, &key, &path, diagnostic)
+    sharing::run(&request, &directory, &key, &path, diagnostic)
 }
 
 fn default_cache_dir() -> Result<PathBuf> {
