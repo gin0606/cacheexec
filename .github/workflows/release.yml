@@ -17,7 +17,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@v6.0.2
         with:
           fetch-depth: 0
 
@@ -47,7 +47,7 @@ jobs:
 
       # Fail before the platform builds if the shared tap credentials are unavailable.
       - name: Check the tap credentials
-        uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
+        uses: actions/create-github-app-token@v3.0.0
         with:
           app-id: ${{ secrets.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
@@ -77,7 +77,7 @@ jobs:
             install_musl: false
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@v6.0.2
 
       - uses: dtolnay/rust-toolchain@1.98.0
         with:
@@ -104,7 +104,7 @@ jobs:
           cp LICENSE README.md "$directory/"
           tar -czf "$directory.tar.gz" "$directory"
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@v7.0.1
         with:
           name: cacheexec-${{ matrix.target }}
           path: cacheexec-v${{ needs.validate.outputs.version }}-${{ matrix.target }}.tar.gz
@@ -116,13 +116,13 @@ jobs:
     env:
       VERSION: ${{ needs.validate.outputs.version }}
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@v8.0.1
         with:
           pattern: cacheexec-*
           path: artifacts
           merge-multiple: true
 
-      - uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
+      - uses: actions/create-github-app-token@v3.0.0
         id: app-token
         with:
           app-id: ${{ secrets.APP_ID }}
@@ -130,7 +130,7 @@ jobs:
           owner: gin0606
           repositories: homebrew-tap
 
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@v6.0.2
         with:
           repository: gin0606/homebrew-tap
           token: ${{ steps.app-token.outputs.token }}
